@@ -1,0 +1,5 @@
+id,created_at,qty,asset,transfer_type,status,underlying,instrument_type,fee_type,funding_rate,funding_type
+0d78698f-dc0a-41fc-bc51-476369a0ac6e,2025-11-20T16:57:51.011861Z,321.555734000000,USDC,deposit,confirmed,,,,,
+a86cba62-3699-4850-9193-f4cddeab2087,2025-11-20T16:57:51.011861Z,-0.100000000000,USDC,fee,confirmed,,,deposit,,
+c4c75072-c20c-47a1-bd10-52c6cb0df96d,2025-11-20T16:47:02.254765Z,-114.755060000000,USDC,realized_pnl,confirmed,SOL,perpetual_future,,,
+eef4ea76-b187-40c6-9abd-01aac27e7059,2025-11-20T16:00:00Z,-0.600356000000,USDC,funding,confirmed,SOL,perpetual_future,,0.0000754789671204397,

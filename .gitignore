@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+apps/api/app/data/
+
+# Node
+node_modules/
+apps/web/node_modules/
+apps/web/dist/
+*.local
+*.tsbuildinfo
+
+# Stale nested copy (do not commit)
+apps/web/apps/
+
+# Runtime state / caches / personal ledger (keep folder via .gitkeep)
+data/*
+!data/.gitkeep
+
+# Secrets
+.env
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

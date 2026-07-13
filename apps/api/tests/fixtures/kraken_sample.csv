@@ -1,0 +1,4 @@
+"txid","refid","time","type","subtype","aclass","subclass","asset","wallet","amount","fee","balance"
+"LKNJ5P-4G7UZ-UTVL6C","FTiViBM-5HT1X2eHptfnoKkkH8Dzhw","2023-07-14 20:58:26","deposit","","currency","fiat","GBP","spot / main",100.0000,0,100.0000
+"LJTMJI-PBWYD-STUQOK","TGPNNJ-F5Q3J-M66DZ3","2023-07-15 21:27:37","trade","tradespot","currency","fiat","GBP","spot / main",-100.0000,0,0.0000
+"LJVJDQ-6PJTJ-PGDPI4","TGPNNJ-F5Q3J-M66DZ3","2023-07-15 21:27:37","trade","tradespot","currency","stable_coin","USDT","spot / main",130.71895424,0.26143791,130.45751633

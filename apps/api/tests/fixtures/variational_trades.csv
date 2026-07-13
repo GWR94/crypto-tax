@@ -1,0 +1,2 @@
+id,created_at,side,instrument_type,underlying,price,qty,trade_type,status,liquidation_trigger_price
+c2d53ea3-0adf-4617-99ef-37d9ccb64f9d,2025-11-20T16:47:02.238648Z,sell,perpetual_future,SOL,130.845485,28.982100000000,liquidation,confirmed,
