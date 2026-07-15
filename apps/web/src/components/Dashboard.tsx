@@ -40,7 +40,7 @@ function jurisdictionSubtitle(jurisdiction: TaxJurisdiction): string {
   if (jurisdiction === "UK") {
     return "UK capital gains · HMRC share-matching & Section 104 pools";
   }
-  return "US capital gains · deterministic FIFO / HIFO accounting";
+  return "US capital gains · deterministic FIFO / LIFO / HIFO accounting";
 }
 
 function perpTreatmentFor(
@@ -87,16 +87,21 @@ export function Dashboard() {
   }
 
   const fetchDashboard = useCallback(async () => {
-    const [settings, data, txs, labels, scams, demo, imports, breakdown, gaps, overlaps, health] =
+    // Normalize the ledger via /transactions before portfolio/tax reads so a
+    // fresh import cannot race KPI totals against an un-normalized ledger.
+    // (API endpoints also normalize server-side; this keeps the UI sequence clear.)
+    const settings = await api
+      .getSettings()
+      .catch(() => ({
+        tax_jurisdiction: "UK" as const,
+        reporting_currency: "GBP",
+      }));
+
+    const txs = await api.getTransactions();
+
+    const [data, labels, scams, demo, imports, breakdown, gaps, overlaps, health] =
       await Promise.all([
-        api
-          .getSettings()
-          .catch(() => ({
-            tax_jurisdiction: "UK" as const,
-            reporting_currency: "GBP",
-          })),
         api.getPortfolio(method, displayCurrency),
-        api.getTransactions(),
         api.getAssetLabels(),
         api.getScamAssets().catch(() => ({ assets: [] })),
         api.getDemoStatus().catch(() => ({ count: 0, active: false })),
@@ -362,11 +367,27 @@ export function Dashboard() {
   }
 
   async function handleReset() {
+    const count = transactions.length;
+    const confirmed = window.confirm(
+      `Reset replaces your live ledger (${count.toLocaleString()} transaction${
+        count === 1 ? "" : "s"
+      }) with the bundled sample dataset.\n\n` +
+        "A JSON backup will download first. You can re-import that file later " +
+        '(Import → enable "Replace existing ledger").\n\n' +
+        "A copy is also saved on disk as data/ledger.json.bak.\n\nContinue?"
+    );
+    if (!confirmed) return;
+
     setBusy("reset");
     setNotice(null);
     try {
-      await api.resetTransactions();
-      refreshAfterMutation("Ledger reset to the bundled sample dataset.");
+      const filename = await api.downloadLedgerBackup();
+      const result = await api.resetTransactions();
+      refreshAfterMutation(
+        `Backup saved as ${filename}` +
+          (result.local_backup ? " (and data/ledger.json.bak)" : "") +
+          ". Ledger reset to the bundled sample dataset."
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -479,6 +500,7 @@ export function Dashboard() {
                 aria-label="Accounting method"
               >
                 <option value="FIFO">FIFO</option>
+                <option value="LIFO">LIFO</option>
                 <option value="HIFO">HIFO</option>
               </Select>
             ) : null}
@@ -555,6 +577,7 @@ export function Dashboard() {
             <Button
               variant="ghost"
               size="sm"
+              title="Downloads a JSON backup, then replaces the live ledger with sample data"
               onClick={handleReset}
               disabled={busy === "reset" || isDemo}
             >

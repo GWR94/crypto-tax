@@ -23,6 +23,7 @@ from .hmrc_cgt_engine import (
     calculate_uk_cgt,
     calculate_uk_income,
     compute_uk_missing_cost_basis,
+    compute_uk_open_pools,
 )
 from .ledger_normalize import normalize_tax_ledger
 from .schemas import CgtMatchType, Transaction, TransactionType
@@ -191,6 +192,7 @@ def fixture_match_polluted_trade_group() -> List[Transaction]:
 
 
 def fixture_defi_kamino_lend_deposit() -> List[Transaction]:
+    """Kamino Lend deposit arrives as TRANSFER OUT; tax pass makes it a disposal."""
     return [
         _tx(
             "kamino-msol-buy",
@@ -198,22 +200,65 @@ def fixture_defi_kamino_lend_deposit() -> List[Transaction]:
             "MSOL",
             TransactionType.BUY,
             2.021458952,
-            250.0,
-            currency="USD",
+            200.0,
+            currency="GBP",
             source="solana",
         ),
         _tx(
             "kamino-deposit",
             "2024-02-12T11:46:10",
             "MSOL",
-            TransactionType.SELL,
+            TransactionType.TRANSFER,
             2.021458952,
-            260.0,
-            currency="USD",
+            210.0,
+            currency="GBP",
             source="solana",
+            direction="OUT",
             gid=KAMINO_DEPOSIT_SIG,
             on_chain=KAMINO_DEPOSIT_SIG,
             counterparty=KAMINO_LEND,
+        ),
+    ]
+
+
+def fixture_defi_lp_add() -> List[Transaction]:
+    """Same-signature SOL+USDC outs — AMM LP add without an on-chain LP mint row."""
+    return [
+        _tx(
+            "sol-pool-buy",
+            "2024-01-01T00:00:00Z",
+            "SOL",
+            TransactionType.BUY,
+            1.0,
+            100.0,
+            currency="GBP",
+            source="solana",
+        ),
+        _tx(
+            "lp-sol-out",
+            "2024-06-01T12:00:00Z",
+            "SOL",
+            TransactionType.TRANSFER,
+            1.0,
+            145.0,
+            currency="GBP",
+            source="solana",
+            direction="OUT",
+            gid="lp-add-1",
+            on_chain="lp-add-1",
+        ),
+        _tx(
+            "lp-usdc-out",
+            "2024-06-01T12:00:00Z",
+            "USDC",
+            TransactionType.TRANSFER,
+            150.0,
+            150.0,
+            currency="GBP",
+            source="solana",
+            direction="OUT",
+            gid="lp-add-1",
+            on_chain="lp-add-1",
         ),
     ]
 
@@ -390,6 +435,7 @@ FIXTURE_BUILDERS: dict[str, Callable[[], List[Transaction]]] = {
     "match-jupiter-swap": fixture_match_jupiter_swap,
     "match-polluted-trade-group": fixture_match_polluted_trade_group,
     "defi-kamino-lend-deposit": fixture_defi_kamino_lend_deposit,
+    "defi-lp-add": fixture_defi_lp_add,
     "lst-unstake-yield": fixture_lst_unstake_yield,
     "lst-no-false-unmatched": fixture_lst_false_unmatched,
     "income-arb-airdrop": fixture_income_arb,
@@ -458,11 +504,20 @@ HMRC_MATRIX_CASES: tuple[HmrcMatrixCase, ...] = (
     HmrcMatrixCase(
         case_id="defi-kamino-lend-deposit",
         category="defi",
-        status=MatrixStatus.KNOWN_GAP,
+        status=MatrixStatus.PASS,
         description="Kamino Lend MSOL deposit after prior acquisition",
         hmrc_expectation="CGT disposal of MSOL at FMV on deposit",
         risk_if_wrong="Under-reported CGT — deposit treated as internal transfer",
         reference=KAMINO_DEPOSIT_SIG,
+    ),
+    HmrcMatrixCase(
+        case_id="defi-lp-add",
+        category="defi",
+        status=MatrixStatus.PASS,
+        description="AMM LP add (same-signature SOL+USDC outs, synthetic LP share)",
+        hmrc_expectation="CGT disposal of contributed assets; LP token acquisition at aggregate FMV",
+        risk_if_wrong="Under-reported CGT on LP deposits; pool share basis wrong",
+        reference="lp-add-1",
     ),
     HmrcMatrixCase(
         case_id="lst-unstake-yield",
@@ -579,18 +634,44 @@ def run_matrix_case(case_id: str) -> None:
         assert tx.on_chain_tx_id == KAMINO_WITHDRAW_SIG
 
     elif case_id == "defi-kamino-lend-deposit":
-        # Current engine policy: lending deposit is not a CGT disposal.
-        msol_legs = [t for t in normalized if t.asset == "MSOL"]
-        assert any(
-            t.transaction_type == TransactionType.TRANSFER
-            and t.transfer_direction == "OUT"
-            for t in msol_legs
-        )
-        report = calculate_uk_cgt(normalized, tax_year_label="2024/25")
+        deposit = next(t for t in normalized if t.id == "kamino-deposit")
+        assert deposit.transaction_type == TransactionType.SELL
+        assert deposit.event_subtype == "lend_deposit"
+        assert deposit.fiat_value_at_trigger == 210.0
+        report = calculate_uk_cgt(normalized, tax_year_label="2023/24")
         deposit_disposals = [
             r for r in report.rows if r.disposal_id == "kamino-deposit"
         ]
-        assert deposit_disposals == []
+        assert len(deposit_disposals) == 1
+        assert deposit_disposals[0].proceeds == 210.0
+        assert deposit_disposals[0].allowable_cost == 200.0
+        assert deposit_disposals[0].gain == 10.0
+
+    elif case_id == "defi-lp-add":
+        sells = [
+            t
+            for t in normalized
+            if t.transaction_type == TransactionType.SELL
+            and t.event_subtype == "lp_add"
+        ]
+        assert {t.asset for t in sells} == {"SOL", "USDC"}
+        lp_buy = next(
+            t
+            for t in normalized
+            if t.transaction_type == TransactionType.BUY and t.event_subtype == "lp_add"
+        )
+        assert lp_buy.asset == "LP:LP-ADD-1"
+        assert lp_buy.fiat_value_at_trigger == 295.0
+        report = calculate_uk_cgt(normalized, tax_year_label="2024/25")
+        sol_row = next(r for r in report.rows if r.disposal_id == "lp-sol-out")
+        assert sol_row.proceeds == 145.0
+        assert sol_row.allowable_cost == 100.0
+        assert sol_row.gain == 45.0
+        # USDC stablecoin legs are excluded from the spot CGT schedule.
+        assert not any(r.disposal_id == "lp-usdc-out" for r in report.rows)
+        pools = compute_uk_open_pools(normalized)
+        assert "LP:LP-ADD-1" in pools
+        assert pools["LP:LP-ADD-1"] == (1.0, 295.0)
 
     elif case_id == "lst-unstake-yield":
         staking = [t for t in normalized if t.transaction_type == TransactionType.STAKING]

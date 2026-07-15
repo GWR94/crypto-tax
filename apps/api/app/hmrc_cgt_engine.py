@@ -2,7 +2,8 @@
 
 Implements HMRC share-matching rules for crypto assets (per CRYPTO22000):
 
-1. Same-day rule: disposals match acquisitions on the same day.
+1. Same-day rule: disposals match acquisitions on the same day (after collapsing
+   multiple same-day buys/sells of the same token into one event).
 2. Bed-and-breakfast (30-day) rule: disposals match acquisitions made in the
    30 days following the disposal.
 3. Section 104 pool: the remainder is matched against the running average-cost
@@ -11,6 +12,9 @@ Implements HMRC share-matching rules for crypto assets (per CRYPTO22000):
 All values are computed in sterling (GBP) using historical FX at the date of
 each event, reusing the conversion helpers from :mod:`app.tax_engine`.
 
+Pool / matching arithmetic uses :class:`~decimal.Decimal` internally; API report
+rows remain floats quantized to 8 dp (qty) / 2 dp (fiat).
+
 This module is deliberately separate from the FIFO/HIFO engine so the US
 (IRS Form 8949) path stays unchanged.
 """
@@ -18,11 +22,13 @@ This module is deliberately separate from the FIFO/HIFO engine so the US
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Dict, List, Optional
 
 from .config import is_stablecoin
 from .income_classification import enrich_income_fiat_values
+from .money import D, as_float_fiat, as_float_qty, is_dust_qty
 from .schemas import (
     ACQUISITION_TYPES,
     DISPOSAL_TYPES,
@@ -41,9 +47,6 @@ from .tax_engine import _tx_fee_reporting, _tx_value_reporting
 from .transfer_matching import match_transfer_pairs
 from .uk_tax_year import annual_exempt_amount, is_in_tax_year, uk_calendar_date
 
-# Quantities below this are treated as fully consumed (float noise guard).
-_EPS = 1e-9
-
 # HMRC bed-and-breakfast window: acquisitions within 30 days after a disposal.
 _BNB_DAYS = 30
 
@@ -52,28 +55,28 @@ _BNB_DAYS = 30
 class _Acquisition:
     tx_id: str
     when: datetime
-    quantity: float
-    cost: float  # total GBP allowable cost for the full quantity
-    remaining: float = field(default=0.0)
+    quantity: Decimal
+    cost: Decimal  # total GBP allowable cost for the full quantity
+    remaining: Decimal = field(default_factory=lambda: Decimal("0"))
 
-    def cost_for(self, matched: float) -> float:
+    def cost_for(self, matched: Decimal) -> Decimal:
         if self.quantity <= 0:
-            return 0.0
-        return self.cost * (matched / self.quantity)
+            return Decimal("0")
+        return (self.cost * matched) / self.quantity
 
 
 @dataclass
 class _Disposal:
     tx_id: str
     when: datetime
-    quantity: float
-    proceeds: float  # total GBP proceeds for the full quantity
-    remaining: float = field(default=0.0)
+    quantity: Decimal
+    proceeds: Decimal  # total GBP proceeds for the full quantity
+    remaining: Decimal = field(default_factory=lambda: Decimal("0"))
 
-    def proceeds_for(self, matched: float) -> float:
+    def proceeds_for(self, matched: Decimal) -> Decimal:
         if self.quantity <= 0:
-            return 0.0
-        return self.proceeds * (matched / self.quantity)
+            return Decimal("0")
+        return (self.proceeds * matched) / self.quantity
 
 
 def _collect(transactions: List[Transaction]) -> Dict[str, Dict[str, list]]:
@@ -93,16 +96,17 @@ def _collect(transactions: List[Transaction]) -> Dict[str, Dict[str, list]]:
             continue
 
         bucket = per_asset.setdefault(asset, {"acq": [], "disp": []})
+        qty = D(tx.amount)
 
         if tx.transaction_type in ACQUISITION_TYPES:
-            cost = _tx_value_reporting(tx) + _tx_fee_reporting(tx)
+            cost = D(_tx_value_reporting(tx)) + D(_tx_fee_reporting(tx))
             bucket["acq"].append(
                 _Acquisition(
                     tx_id=tx.id,
                     when=tx.timestamp,
-                    quantity=tx.amount,
+                    quantity=qty,
                     cost=cost,
-                    remaining=tx.amount,
+                    remaining=qty,
                 )
             )
         elif tx.transaction_type in DISPOSAL_TYPES:
@@ -111,16 +115,16 @@ def _collect(transactions: List[Transaction]) -> Dict[str, Dict[str, list]]:
             # do not subtract fee_fiat again (that field is for sell-side costs).
             # Incidental fiat fees on a SELL still reduce proceeds.
             if tx.transaction_type == TransactionType.FEE:
-                proceeds = _tx_value_reporting(tx)
+                proceeds = D(_tx_value_reporting(tx))
             else:
-                proceeds = _tx_value_reporting(tx) - _tx_fee_reporting(tx)
+                proceeds = D(_tx_value_reporting(tx)) - D(_tx_fee_reporting(tx))
             bucket["disp"].append(
                 _Disposal(
                     tx_id=tx.id,
                     when=tx.timestamp,
-                    quantity=tx.amount,
+                    quantity=qty,
                     proceeds=proceeds,
-                    remaining=tx.amount,
+                    remaining=qty,
                 )
             )
         elif (
@@ -132,14 +136,14 @@ def _collect(transactions: List[Transaction]) -> Dict[str, Dict[str, list]]:
         ):
             # An external receipt with a known value that is not the inbound leg
             # of an internal move establishes cost basis under HMRC rules.
-            cost = _tx_value_reporting(tx) + _tx_fee_reporting(tx)
+            cost = D(_tx_value_reporting(tx)) + D(_tx_fee_reporting(tx))
             bucket["acq"].append(
                 _Acquisition(
                     tx_id=tx.id,
                     when=tx.timestamp,
-                    quantity=tx.amount,
+                    quantity=qty,
                     cost=cost,
-                    remaining=tx.amount,
+                    remaining=qty,
                 )
             )
         elif (
@@ -150,14 +154,14 @@ def _collect(transactions: List[Transaction]) -> Dict[str, Dict[str, list]]:
         ):
             # Outbound moves that are not the paired leg of an internal transfer
             # are disposals (swaps, sends to third parties, DeFi deposits, etc.).
-            proceeds = _tx_value_reporting(tx) - _tx_fee_reporting(tx)
+            proceeds = D(_tx_value_reporting(tx)) - D(_tx_fee_reporting(tx))
             bucket["disp"].append(
                 _Disposal(
                     tx_id=tx.id,
                     when=tx.timestamp,
-                    quantity=tx.amount,
+                    quantity=qty,
                     proceeds=proceeds,
-                    remaining=tx.amount,
+                    remaining=qty,
                 )
             )
         # Paired internal transfers and value-less receipts leave the pool
@@ -166,25 +170,85 @@ def _collect(transactions: List[Transaction]) -> Dict[str, Dict[str, list]]:
     return per_asset
 
 
+def _aggregate_same_day_acquisitions(
+    acquisitions: List[_Acquisition],
+) -> List[_Acquisition]:
+    """Collapse same-calendar-day buys into one acquisition (CRYPTO22250)."""
+    if len(acquisitions) <= 1:
+        return acquisitions
+
+    by_day: Dict[date, List[_Acquisition]] = {}
+    for acq in acquisitions:
+        by_day.setdefault(uk_calendar_date(acq.when), []).append(acq)
+
+    aggregated: List[_Acquisition] = []
+    for day in sorted(by_day):
+        group = sorted(by_day[day], key=lambda a: (a.when, a.tx_id))
+        if len(group) == 1:
+            aggregated.append(group[0])
+            continue
+        total_qty = sum((a.quantity for a in group), Decimal("0"))
+        total_cost = sum((a.cost for a in group), Decimal("0"))
+        aggregated.append(
+            _Acquisition(
+                tx_id="+".join(a.tx_id for a in group),
+                when=group[0].when,
+                quantity=total_qty,
+                cost=total_cost,
+                remaining=total_qty,
+            )
+        )
+    return aggregated
+
+
+def _aggregate_same_day_disposals(disposals: List[_Disposal]) -> List[_Disposal]:
+    """Collapse same-calendar-day sells into one disposal (CRYPTO22250)."""
+    if len(disposals) <= 1:
+        return disposals
+
+    by_day: Dict[date, List[_Disposal]] = {}
+    for disp in disposals:
+        by_day.setdefault(uk_calendar_date(disp.when), []).append(disp)
+
+    aggregated: List[_Disposal] = []
+    for day in sorted(by_day):
+        group = sorted(by_day[day], key=lambda d: (d.when, d.tx_id))
+        if len(group) == 1:
+            aggregated.append(group[0])
+            continue
+        total_qty = sum((d.quantity for d in group), Decimal("0"))
+        total_proceeds = sum((d.proceeds for d in group), Decimal("0"))
+        aggregated.append(
+            _Disposal(
+                tx_id="+".join(d.tx_id for d in group),
+                when=group[0].when,
+                quantity=total_qty,
+                proceeds=total_proceeds,
+                remaining=total_qty,
+            )
+        )
+    return aggregated
+
+
 def _emit(
     rows: List[CgtDisposalRow],
     asset: str,
     disposal: _Disposal,
-    matched: float,
-    proceeds: float,
-    cost: float,
+    matched: Decimal,
+    proceeds: Decimal,
+    cost: Decimal,
     match_type: CgtMatchType,
     acquisition: Optional[_Acquisition],
 ) -> None:
     rows.append(
         CgtDisposalRow(
             asset=asset,
-            quantity=round(matched, 8),
+            quantity=as_float_qty(matched),
             disposal_date=disposal.when,
             acquisition_date=acquisition.when if acquisition else None,
-            proceeds=round(proceeds, 2),
-            allowable_cost=round(cost, 2),
-            gain=round(proceeds - cost, 2),
+            proceeds=as_float_fiat(proceeds),
+            allowable_cost=as_float_fiat(cost),
+            gain=as_float_fiat(proceeds - cost),
             match_type=match_type,
             disposal_id=disposal.tx_id,
             acquisition_ids=[acquisition.tx_id] if acquisition else [],
@@ -200,12 +264,12 @@ def _match_same_day(
     rows: List[CgtDisposalRow],
 ) -> None:
     for disposal in disposals:
-        if disposal.remaining <= _EPS:
+        if is_dust_qty(disposal.remaining):
             continue
         for acq in acquisitions:
-            if disposal.remaining <= _EPS:
+            if is_dust_qty(disposal.remaining):
                 break
-            if acq.remaining <= _EPS:
+            if is_dust_qty(acq.remaining):
                 continue
             if uk_calendar_date(acq.when) != uk_calendar_date(disposal.when):
                 continue
@@ -232,13 +296,13 @@ def _match_thirty_day(
 ) -> None:
     # Disposals earliest first; each matched to the earliest later acquisitions.
     for disposal in sorted(disposals, key=lambda d: d.when):
-        if disposal.remaining <= _EPS:
+        if is_dust_qty(disposal.remaining):
             continue
         later = sorted(
             (
                 a
                 for a in acquisitions
-                if a.remaining > _EPS
+                if not is_dust_qty(a.remaining)
                 and 0
                 < (
                     uk_calendar_date(a.when) - uk_calendar_date(disposal.when)
@@ -248,7 +312,7 @@ def _match_thirty_day(
             key=lambda a: a.when,
         )
         for acq in later:
-            if disposal.remaining <= _EPS:
+            if is_dust_qty(disposal.remaining):
                 break
             matched = min(disposal.remaining, acq.remaining)
             _emit(
@@ -270,7 +334,7 @@ def _match_section_104(
     acquisitions: List[_Acquisition],
     disposals: List[_Disposal],
     rows: List[CgtDisposalRow],
-) -> tuple[float, float]:
+) -> tuple[Decimal, Decimal]:
     """Match remaining disposals against the Section 104 pool.
 
     Returns ``(pool_quantity, pool_cost)`` remaining after all events.
@@ -278,28 +342,28 @@ def _match_section_104(
     # Merge remaining events chronologically; acquisitions before disposals on ties.
     events: list[tuple[datetime, int, object]] = []
     for acq in acquisitions:
-        if acq.remaining > _EPS:
+        if not is_dust_qty(acq.remaining):
             events.append((acq.when, 0, acq))
     for disposal in disposals:
-        if disposal.remaining > _EPS:
+        if not is_dust_qty(disposal.remaining):
             events.append((disposal.when, 1, disposal))
     events.sort(key=lambda e: (e[0], e[1]))
 
-    pool_qty = 0.0
-    pool_cost = 0.0
+    pool_qty = Decimal("0")
+    pool_cost = Decimal("0")
 
     for _when, kind, obj in events:
         if kind == 0:
             acq = obj  # type: ignore[assignment]
             pool_qty += acq.remaining
             pool_cost += acq.cost_for(acq.remaining)
-            acq.remaining = 0.0
+            acq.remaining = Decimal("0")
             continue
 
         disposal = obj  # type: ignore[assignment]
-        if pool_qty > _EPS:
+        if not is_dust_qty(pool_qty):
             matched = min(disposal.remaining, pool_qty)
-            avg_cost = pool_cost / pool_qty if pool_qty > 0 else 0.0
+            avg_cost = pool_cost / pool_qty if pool_qty > 0 else Decimal("0")
             cost_share = avg_cost * matched
             _emit(
                 rows,
@@ -314,8 +378,11 @@ def _match_section_104(
             pool_qty -= matched
             pool_cost -= cost_share
             disposal.remaining -= matched
+            if is_dust_qty(pool_qty):
+                pool_qty = Decimal("0")
+                pool_cost = Decimal("0")
 
-        if disposal.remaining > _EPS:
+        if not is_dust_qty(disposal.remaining):
             # No acquisition history covers this portion of the disposal.
             _emit(
                 rows,
@@ -323,11 +390,11 @@ def _match_section_104(
                 disposal,
                 disposal.remaining,
                 disposal.proceeds_for(disposal.remaining),
-                0.0,
+                Decimal("0"),
                 CgtMatchType.UNMATCHED,
                 None,
             )
-            disposal.remaining = 0.0
+            disposal.remaining = Decimal("0")
 
     return pool_qty, pool_cost
 
@@ -344,8 +411,8 @@ def _all_disposal_rows(transactions: List[Transaction]) -> List[CgtDisposalRow]:
         if not bucket["disp"]:
             continue
         asset_rows: List[CgtDisposalRow] = []
-        acquisitions: List[_Acquisition] = bucket["acq"]
-        disposals: List[_Disposal] = bucket["disp"]
+        acquisitions = _aggregate_same_day_acquisitions(list(bucket["acq"]))
+        disposals = _aggregate_same_day_disposals(list(bucket["disp"]))
         _match_same_day(asset, acquisitions, disposals, asset_rows)
         _match_thirty_day(asset, acquisitions, disposals, asset_rows)
         _match_section_104(asset, acquisitions, disposals, asset_rows)
@@ -359,7 +426,7 @@ def _run_uk_matching_for_asset(
     asset: str,
     acquisitions: List[_Acquisition],
     disposals: List[_Disposal],
-) -> tuple[float, float]:
+) -> tuple[Decimal, Decimal]:
     """Run HMRC matching and return the Section 104 pool balance."""
     rows: List[CgtDisposalRow] = []
     _match_same_day(asset, acquisitions, disposals, rows)
@@ -371,26 +438,60 @@ def compute_uk_open_pools(
     transactions: List[Transaction],
 ) -> Dict[str, tuple[float, float]]:
     """Per-asset Section 104 pool balances after full HMRC share-matching."""
+    return {
+        asset: (qty, cost)
+        for asset, (qty, cost, _acquired_at) in compute_uk_open_pool_details(
+            transactions
+        ).items()
+    }
+
+
+def compute_uk_open_pool_details(
+    transactions: List[Transaction],
+) -> Dict[str, tuple[float, float, datetime]]:
+    """Open Section 104 pools as ``(qty, cost, earliest_acquisition)``.
+
+    ``earliest_acquisition`` is the earliest buy that still had quantity after
+    same-day / 30-day matching (i.e. that entered the average-cost pool).
+    """
     from .wallet_enrichment import enrich_fee_fiat_values
 
     transactions, _ = enrich_fee_fiat_values(transactions)
     per_asset = _collect(transactions)
-    pools: Dict[str, tuple[float, float]] = {}
+    pools: Dict[str, tuple[float, float, datetime]] = {}
 
     for asset, bucket in per_asset.items():
-        acquisitions: List[_Acquisition] = list(bucket["acq"])
-        disposals: List[_Disposal] = list(bucket["disp"])
+        acquisitions = _aggregate_same_day_acquisitions(list(bucket["acq"]))
+        disposals = _aggregate_same_day_disposals(list(bucket["disp"]))
         if not acquisitions:
             continue
+
         if not disposals:
-            pool_qty = sum(a.quantity for a in acquisitions)
-            pool_cost = sum(a.cost for a in acquisitions)
+            pool_qty = sum((a.quantity for a in acquisitions), Decimal("0"))
+            pool_cost = sum((a.cost for a in acquisitions), Decimal("0"))
+            earliest = min(a.when for a in acquisitions)
         else:
-            pool_qty, pool_cost = _run_uk_matching_for_asset(
-                asset, acquisitions, disposals
+            # Consume same-day / bed-and-breakfast matches first so earliest
+            # reflects only lots that entered the Section 104 pool.
+            scratch: List[CgtDisposalRow] = []
+            _match_same_day(asset, acquisitions, disposals, scratch)
+            _match_thirty_day(asset, acquisitions, disposals, scratch)
+            pool_entries = [
+                a for a in acquisitions if not is_dust_qty(a.remaining)
+            ]
+            if not pool_entries:
+                continue
+            earliest = min(a.when for a in pool_entries)
+            pool_qty, pool_cost = _match_section_104(
+                asset, acquisitions, disposals, scratch
             )
-        if pool_qty > _EPS:
-            pools[asset] = (pool_qty, pool_cost)
+
+        if not is_dust_qty(pool_qty):
+            pools[asset] = (
+                as_float_qty(pool_qty),
+                as_float_fiat(pool_cost),
+                earliest,
+            )
 
     return pools
 
@@ -405,11 +506,11 @@ def compute_uk_open_acquisitions(
     per_asset = _collect(transactions)
     open_by_asset: Dict[str, List[_Acquisition]] = {}
     for asset, bucket in per_asset.items():
-        acquisitions: List[_Acquisition] = list(bucket["acq"])
-        disposals: List[_Disposal] = list(bucket["disp"])
+        acquisitions = _aggregate_same_day_acquisitions(list(bucket["acq"]))
+        disposals = _aggregate_same_day_disposals(list(bucket["disp"]))
         pool_qty, _pool_cost = _run_uk_matching_for_asset(asset, acquisitions, disposals)
-        if pool_qty > _EPS:
-            open_by_asset[asset] = bucket["acq"]
+        if not is_dust_qty(pool_qty):
+            open_by_asset[asset] = acquisitions
     return open_by_asset
 
 
@@ -451,14 +552,20 @@ def calculate_uk_cgt(
     if tax_year_label:
         rows = [r for r in rows if is_in_tax_year(r.disposal_date, tax_year_label)]
 
-    total_proceeds = round(sum(r.proceeds for r in rows), 2)
-    total_costs = round(sum(r.allowable_cost for r in rows), 2)
-    total_gains = round(sum(r.gain for r in rows if r.gain > 0), 2)
-    total_losses = round(sum(-r.gain for r in rows if r.gain < 0), 2)
-    net_gain = round(total_gains - total_losses, 2)
+    total_proceeds = as_float_fiat(sum((D(r.proceeds) for r in rows), Decimal("0")))
+    total_costs = as_float_fiat(
+        sum((D(r.allowable_cost) for r in rows), Decimal("0"))
+    )
+    total_gains = as_float_fiat(
+        sum((D(r.gain) for r in rows if r.gain > 0), Decimal("0"))
+    )
+    total_losses = as_float_fiat(
+        sum((-D(r.gain) for r in rows if r.gain < 0), Decimal("0"))
+    )
+    net_gain = as_float_fiat(D(total_gains) - D(total_losses))
 
     allowance = annual_exempt_amount(tax_year_label) if tax_year_label else 0.0
-    taxable = round(max(0.0, net_gain - allowance), 2)
+    taxable = as_float_fiat(max(Decimal("0"), D(net_gain) - D(allowance)))
 
     return UkCgtSummary(
         tax_year_label=tax_year_label,
@@ -494,23 +601,28 @@ def calculate_uk_income(
                 date=tx.timestamp,
                 asset=tx.asset,
                 kind=tx.transaction_type.value,
-                quantity=round(tx.amount, 8),
-                value_gbp=round(_tx_value_reporting(tx), 2),
+                quantity=as_float_qty(tx.amount),
+                value_gbp=as_float_fiat(_tx_value_reporting(tx)),
                 tx_id=tx.id,
             )
         )
 
     rows.sort(key=lambda r: (r.date, r.asset))
-    airdrop = round(
-        sum(r.value_gbp for r in rows if r.kind == TransactionType.AIRDROP.value), 2
+    airdrop = as_float_fiat(
+        sum(
+            (D(r.value_gbp) for r in rows if r.kind == TransactionType.AIRDROP.value),
+            Decimal("0"),
+        )
     )
-    staking = round(
-        sum(r.value_gbp for r in rows if r.kind == TransactionType.STAKING.value), 2
+    staking = as_float_fiat(
+        sum(
+            (D(r.value_gbp) for r in rows if r.kind == TransactionType.STAKING.value),
+            Decimal("0"),
+        )
     )
-
     return UkIncomeSummary(
         tax_year_label=tax_year_label,
-        total_income=round(airdrop + staking, 2),
+        total_income=as_float_fiat(D(airdrop) + D(staking)),
         airdrop_income=airdrop,
         staking_income=staking,
         rows=rows,

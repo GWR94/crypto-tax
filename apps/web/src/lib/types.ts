@@ -22,7 +22,7 @@ export interface TaxSettings {
 
 export type DisplayCurrency = "GBP" | "USD";
 
-export type AccountingMethod = "FIFO" | "HIFO" | "SECTION_104";
+export type AccountingMethod = "FIFO" | "LIFO" | "HIFO" | "SECTION_104";
 
 export interface AssetLabel {
   symbol: string;
@@ -52,6 +52,8 @@ export interface Transaction {
   instrument?: string | null;
   venue_order_type?: string | null;
   realized_pnl?: number | null;
+  event_subtype?: string | null;
+  parent_asset?: string | null;
 }
 
 export interface Position {
@@ -286,7 +288,8 @@ export type CgtMatchType =
   | "same_day"
   | "thirty_day"
   | "section_104"
-  | "unmatched";
+  | "unmatched"
+  | "perp";
 
 export interface CgtDisposalRow {
   asset: string;

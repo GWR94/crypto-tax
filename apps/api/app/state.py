@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import List
@@ -255,10 +257,39 @@ class AppState:
                 self._persist()
             return changed
 
-    def reset_to_sample(self) -> None:
+    def build_backup_payload(self) -> dict:
+        """Serializable full-ledger backup (transactions + cost-basis overrides)."""
+        with self._lock:
+            return {
+                "format": "crypto-tax-ledger-backup",
+                "version": 1,
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "transaction_count": len(self._transactions),
+                "transactions": [
+                    json.loads(t.model_dump_json()) for t in self._transactions
+                ],
+                "cost_basis_overrides": [
+                    json.loads(o.model_dump_json()) for o in self._cost_basis_overrides
+                ],
+            }
+
+    def write_local_backup(self) -> Path | None:
+        """Copy the on-disk ledger to ``ledger.json.bak`` before a destructive reset."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if not STATE_FILE.exists():
+            return None
+        backup_path = STATE_DIR / "ledger.json.bak"
+        shutil.copy2(STATE_FILE, backup_path)
+        if OVERRIDES_FILE.exists():
+            shutil.copy2(OVERRIDES_FILE, STATE_DIR / "cost_basis_overrides.json.bak")
+        return backup_path
+
+    def reset_to_sample(self, *, backup: bool = True) -> Path | None:
+        bak = self.write_local_backup() if backup else None
         with self._lock:
             self._transactions = default_transactions()
             self._persist()
+        return bak
 
 
 # Module-level singleton used by the API layer.

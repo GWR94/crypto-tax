@@ -154,6 +154,19 @@ def test_cross_year_boundary_filtering():
     assert curr.rows[0].disposal_id == "s2"
 
 
+def test_cross_year_boundary_filtering_bst_utc_skew():
+    """UTC evening of 5 Apr is already 6 Apr in London — belongs in 2024/25."""
+    txs = [
+        _tx("b", "2023-01-01T00:00:00", "BTC", TransactionType.BUY, 1, 1000),
+        _tx("s", "2024-04-05T23:30:00Z", "BTC", TransactionType.SELL, 1, 1500),
+    ]
+    prev = calculate_uk_cgt(txs, tax_year_label="2023/24")
+    curr = calculate_uk_cgt(txs, tax_year_label="2024/25")
+    assert prev.disposal_count == 0
+    assert curr.disposal_count == 1
+    assert curr.rows[0].disposal_id == "s"
+
+
 def test_annual_exempt_amount_applied():
     txs = [
         _tx("b", "2024-04-10T00:00:00", "BTC", TransactionType.BUY, 1, 1000),

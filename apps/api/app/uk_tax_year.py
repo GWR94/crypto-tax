@@ -19,10 +19,6 @@ UK_TIMEZONE = ZoneInfo("Europe/London")
 _TAX_YEAR_START = (4, 6)
 
 
-def _as_date(value: datetime | date) -> date:
-    return value.date() if isinstance(value, datetime) else value
-
-
 def uk_calendar_date(value: datetime | date) -> date:
     """Calendar date in the UK (Europe/London) for HMRC same-day / 30-day rules."""
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -35,7 +31,7 @@ def uk_calendar_date(value: datetime | date) -> date:
 
 def uk_tax_year_start_year(value: datetime | date) -> int:
     """Return the calendar year in which the date's UK tax year begins."""
-    d = _as_date(value)
+    d = uk_calendar_date(value)
     return d.year if (d.month, d.day) >= _TAX_YEAR_START else d.year - 1
 
 
@@ -62,9 +58,9 @@ def uk_tax_year_range(label: str) -> Tuple[date, date]:
 
 
 def is_in_tax_year(value: datetime | date, label: str) -> bool:
-    """True when the date falls within the given UK tax-year label."""
+    """True when the UK calendar date falls within the given tax-year label."""
     start, end = uk_tax_year_range(label)
-    d = _as_date(value)
+    d = uk_calendar_date(value)
     return start <= d <= end
 
 

@@ -19,6 +19,7 @@ def _tx(
     *,
     direction: str | None = None,
     source: str | None = None,
+    currency: str = "GBP",
 ) -> Transaction:
     return Transaction(
         id=tx_id,
@@ -27,7 +28,7 @@ def _tx(
         transaction_type=ttype,
         amount=amount,
         fiat_value_at_trigger=value,
-        fiat_currency="GBP",
+        fiat_currency=currency,
         source=source,
         transfer_direction=direction,
     )
@@ -88,6 +89,52 @@ def test_does_not_pair_distant_or_mismatched():
     assert pairs == {}
 
 
+def test_does_not_pair_large_fee_gap_formerly_within_10pct():
+    """A ~9% shortfall must not pair (old PAIR_LOWER_RATIO=0.90 would)."""
+    txs = [
+        _tx(
+            "out",
+            "2024-05-01T07:00:00",
+            TransactionType.TRANSFER,
+            10.0,
+            direction="OUT",
+            source="bitcoin",
+        ),
+        _tx(
+            "in",
+            "2024-05-01T07:30:00",
+            TransactionType.TRANSFER,
+            9.1,
+            direction="IN",
+            source="kraken",
+        ),
+    ]
+    assert match_transfer_pairs(txs) == {}
+
+
+def test_pairs_one_percent_withdrawal_fee():
+    txs = [
+        _tx(
+            "out",
+            "2024-05-01T07:00:00",
+            TransactionType.TRANSFER,
+            1.0,
+            direction="OUT",
+            source="bitcoin",
+        ),
+        _tx(
+            "in",
+            "2024-05-01T07:30:00",
+            TransactionType.TRANSFER,
+            0.99,
+            direction="IN",
+            source="kraken",
+        ),
+    ]
+    pairs = match_transfer_pairs(txs)
+    assert pairs.get("out") == pairs.get("in")
+
+
 def test_unpaired_external_receipt_establishes_uk_basis():
     # Receive BTC on-chain with a known value, then sell it later. The receipt
     # should establish cost basis so the sale is not flagged uncovered.
@@ -107,14 +154,92 @@ def test_internal_transfer_preserves_us_basis():
     # Buy on one venue, move to another, then sell: basis must carry over and
     # not reset to zero across the internal transfer.
     txs = [
-        _tx("buy", "2024-01-01T00:00:00", TransactionType.BUY, 1.0, 20000.0, source="bitcoin"),
-        _tx("out", "2024-02-01T00:00:00", TransactionType.TRANSFER, 1.0, direction="OUT", source="bitcoin"),
-        _tx("in", "2024-02-01T00:30:00", TransactionType.TRANSFER, 1.0, direction="IN", source="kraken"),
-        _tx("sell", "2024-03-01T00:00:00", TransactionType.SELL, 1.0, 30000.0, source="kraken"),
+        _tx(
+            "buy",
+            "2024-01-01T00:00:00",
+            TransactionType.BUY,
+            1.0,
+            20000.0,
+            source="bitcoin",
+            currency="USD",
+        ),
+        _tx(
+            "out",
+            "2024-02-01T00:00:00",
+            TransactionType.TRANSFER,
+            1.0,
+            direction="OUT",
+            source="bitcoin",
+            currency="USD",
+        ),
+        _tx(
+            "in",
+            "2024-02-01T00:30:00",
+            TransactionType.TRANSFER,
+            1.0,
+            direction="IN",
+            source="kraken",
+            currency="USD",
+        ),
+        _tx(
+            "sell",
+            "2024-03-01T00:00:00",
+            TransactionType.SELL,
+            1.0,
+            30000.0,
+            source="kraken",
+            currency="USD",
+        ),
     ]
-    report = calculate_realized_gains(txs, AccountingMethod.FIFO, tax_year=2024)
+    report = calculate_realized_gains(
+        txs, AccountingMethod.FIFO, tax_year=2024, tax_jurisdiction="US"
+    )
     assert report.total_gain == 10000.0
+    assert len(report.rows) == 1
     assert all(not r.missing_cost_basis for r in report.rows)
+
+
+def test_unpaired_transfer_out_is_us_disposal():
+    """Third-party / unmatched outbound must appear on Form 8949, not vanish."""
+    from app.tax_engine import _run_engine
+
+    txs = [
+        _tx(
+            "buy",
+            "2024-01-01T00:00:00",
+            TransactionType.BUY,
+            10.0,
+            1000.0,
+            source="coinbase",
+            currency="USD",
+        ),
+        _tx(
+            "send",
+            "2024-06-01T00:00:00",
+            TransactionType.TRANSFER,
+            8.0,
+            900.0,
+            direction="OUT",
+            source="solana",
+            currency="USD",
+        ),
+    ]
+    report = calculate_realized_gains(
+        txs, AccountingMethod.FIFO, tax_year=2024, tax_jurisdiction="US"
+    )
+    assert len(report.rows) == 1
+    row = report.rows[0]
+    assert row.disposal_id == "send"
+    assert row.quantity == 8.0
+    assert row.proceeds == 900.0
+    assert row.cost_basis == 800.0  # 8/10 of $1000
+    assert row.gain_loss == 100.0
+    assert report.total_gain == 100.0
+    assert not row.missing_cost_basis
+
+    result = _run_engine(txs, AccountingMethod.FIFO, reporting_currency="USD")
+    lots = result.open_lots.get("BTC", [])
+    assert sum(float(lot.quantity) for lot in lots) == 2.0
 
 
 def _cdc_earn_tx(

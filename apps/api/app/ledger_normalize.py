@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from typing import List
 
+from .amm_lp import normalize_lp_for_tax
 from .cryptocom import normalize_cryptocom_exchange_legs
+from .defi_tax import normalize_lending_for_tax
 from .drift import normalize_drift_collateral
 from .exchange_ledger import collapse_exchange_timezone_duplicates
+from .fork_normalize import normalize_hard_forks
 from .income_classification import enrich_income_fiat_values, reclassify_income_events
 from .kamino_vault import normalize_kamino_vault
 from .kraken import (
@@ -41,6 +44,11 @@ def normalize_tax_ledger(txs: List[Transaction]) -> tuple[List[Transaction], boo
     txs, lend_fix = normalize_lending_protocols(txs)
     txs, swap_fix = reclassify_disguised_solana_swaps(txs)
     txs, drift_fix = normalize_drift_collateral(txs)
+    # After protocol parsers emit TRANSFERs, treat lending deposit/withdraw for CGT.
+    txs, lend_tax = normalize_lending_for_tax(txs)
+    # Same-signature multi-asset pool add/remove → lp_add / lp_remove.
+    txs, lp_tax = normalize_lp_for_tax(txs)
+    txs, fork_fix = normalize_hard_forks(txs)
     txs, cdc_fix = normalize_cryptocom_exchange_legs(txs)
     txs, kraken_fix_count = normalize_kraken_ledger(txs)
     kraken_fix = kraken_fix_count > 0
@@ -62,6 +70,9 @@ def normalize_tax_ledger(txs: List[Transaction]) -> tuple[List[Transaction], boo
         or lst_fix
         or kamino_fix
         or lend_fix
+        or lend_tax
+        or lp_tax
+        or fork_fix
         or swap_fix
         or drift_fix
         or cdc_fix

@@ -44,7 +44,7 @@ crypto-tax/
 ├── apps/
 │   ├── api/                 # FastAPI tax engine + ingestion
 │   │   ├── app/
-│   │   │   ├── tax_engine.py        # US FIFO / HIFO lots, Form 8949
+│   │   │   ├── tax_engine.py        # US FIFO / LIFO / HIFO lots, Form 8949
 │   │   │   ├── hmrc_cgt_engine.py   # UK same-day → 30-day → S.104
 │   │   │   ├── ledger_normalize.py  # read-time ledger fixes
 │   │   │   ├── main.py              # REST API
@@ -79,7 +79,7 @@ Also:
 
 ### US (IRS) — `tax_engine.py`
 
-- **FIFO** or **HIFO** lot matching (no LIFO yet)
+- **FIFO**, **LIFO**, or **HIFO** lot matching
 - Short-term vs long-term from holding period (**more than** one year → long-term)
 - Form 8949-style disposal rows and CSV download
 - Same acquisition / disposal / income type model as UK for shared ledger rows
@@ -93,7 +93,7 @@ Also:
 | Paired `TRANSFER` | Non-taxable; basis carries across wallets/exchanges |
 | Unpaired `TRANSFER OUT` | Treated as disposal (third-party send / unmatched move) |
 | Stablecoins | Treated as cash — excluded from CGT pools |
-| Perps | Excluded from spot CGT; configurable as income / capital gains / exclude |
+| Perps | Excluded from spot lot pools; configurable as income / capital gains (folded into CGT / Form 8949 totals) / exclude |
 
 ---
 
@@ -184,14 +184,33 @@ Full OpenAPI schema: http://localhost:8000/docs
 
 These are intentional gaps or work still in progress — do not treat the engine as complete for every DeFi edge case:
 
-- **LIFO** not implemented (US: FIFO / HIFO only)
-- **Hard forks** — no dedicated acquisition / basis-split logic
-- **LP / lending deposits** — some DeFi deposits may still normalize as transfers rather than CGT disposals (see HMRC matrix `known_gap` cases)
-- **Precision** — quantities and pool costs use Python `float` today (not `Decimal`)
-- **US Form 8949** figures currently flow through the GBP reporting path — use with care until USD reporting is jurisdiction-aware
-- Perp tax treatment is **configurable policy**, not a fixed legal classification
+- **AMM LP add/remove** — same-signature multi-asset pool deposits book `lp_add` disposals + a synthetic `LP:{trade_group_id}` acquisition at aggregate FMV (`LP_TAX_TREATMENT`). Remove requires an LP burn/out leg (or the synthetic share) to close basis; Helius mint metadata is still incomplete for some pools
+- **Lending / vault deposits** (Kamino Lend, Marginfi, Drift, Kvault) are treated as CGT disposals at FMV by default (`LENDING_DEPOSIT_TAX_TREATMENT=cgt_disposal`); set `basis_neutral` to keep TRANSFER legs
+- **Hard forks** — configured splits (e.g. ETH→ETHW) synthesize an acquisition at FMV or zero basis (`HARD_FORK_BASIS_POLICY`)
+- **US Form 8949** figures are reported in **USD** when jurisdiction is US (UK schedules stay in GBP)
+- **US long-term** uses the IRS anniversary rule (day after one-year anniversary), not raw day count
+- **UK tax-year bucketing** uses Europe/London calendar dates (same as same-day / 30-day matching)
+- **Precision** — UK Section 104 and US FIFO/HIFO lot math use Python `Decimal` internally (API rows stay float, qty 8 dp / fiat 2 dp)
+- Perp tax treatment is **configurable policy**, not a fixed legal classification.
+  `capital_gains` folds exchange-reported net PnL into CGT / Form 8949 totals as
+  synthetic rows; fills never enter spot FIFO / Section 104 pools.
 
 The HMRC compliance matrix (`apps/api/app/hmrc_matrix.py` + `npm run test:hmrc-matrix`) documents pass / known-gap cases.
+
+### Official HMRC worked examples
+
+Pooling goldens from the Cryptoassets Manual
+([CRYPTO22250](https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22250))
+live in `apps/api/app/hmrc_official_examples.py` and
+`tests/test_hmrc_official_examples.py`:
+
+| Ref | Coverage |
+| --- | --- |
+| CRYPTO22251–22257 | Section 104, same-day, 30-day, crypto-to-crypto (assert exact engine totals; HMRC mid-calc rounding noted) |
+
+**Gaps with no official numerical tables** (staking, airdrops, fees, forks) are covered as
+`narrative_instantiated` / `engine_policy` fixtures citing CRYPTO21200, CRYPTO21250,
+CRYPTO22300, CRYPTO22350 — invented GBP amounts, clear provenance labels.
 
 ---
 

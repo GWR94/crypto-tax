@@ -64,7 +64,7 @@ export function PerCoinRealizedTable({
   const basisNote =
     jurisdiction === "UK"
       ? "HMRC share-matching (same-day, 30-day, Section 104)"
-      : "FIFO or HIFO lot matching";
+      : "FIFO, LIFO, or HIFO lot matching";
 
   const realizedDescription =
     jurisdiction === "UK"

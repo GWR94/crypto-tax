@@ -54,12 +54,11 @@ def test_flags_unpaired_deposit_without_fiat():
     assert "Missing" not in flags[0].message  # message describes purge scenario
 
 
-def test_flags_first_deposit_without_buy_history():
+def test_valued_first_deposit_is_not_orphan():
+    """Valued unpaired IN already establishes basis — do not flag as orphan."""
     txs = [_inflow("dep", "2024-06-01T12:00:00", "ETH", 1.0, fiat=2500.0)]
     flags = find_orphaned_inflows(txs)
-    assert len(flags) == 1
-    assert "first" in flags[0].message.lower()
-
+    assert flags == []
 
 def test_manual_override_establishes_uk_cost_on_sell():
     txs = [
@@ -94,15 +93,19 @@ def test_manual_override_clears_orphan_flag():
 def test_manual_override_applies_to_us_fifo():
     txs = [
         _inflow("dep", "2024-06-01T12:00:00", "ETH", 1.0),
-        _sell("sell", "2024-09-01T12:00:00", "ETH", 1.0, 4000.0),
+        _sell("sell", "2024-09-01T12:00:00", "ETH", 1.0, 4000.0).model_copy(
+            update={"fiat_currency": "USD"}
+        ),
     ]
     override = build_override_from_request(
         anchor=txs[0],
         acquisition_date=datetime(2023, 6, 1, tzinfo=timezone.utc),
         total_fiat_spent=2000.0,
     )
+    override = override.model_copy(update={"reporting_currency": "USD"})
     tax_txs = prepare_tax_ledger(txs, [override])
     report = calculate_realized_gains(
         tax_txs, AccountingMethod.FIFO, tax_year=2024, tax_jurisdiction="US"
     )
+    assert report.reporting_currency == "USD"
     assert report.total_gain == 2000.0

@@ -28,6 +28,7 @@ class AccountingMethod(str, Enum):
     """Supported cost-basis accounting methods."""
 
     FIFO = "FIFO"
+    LIFO = "LIFO"
     HIFO = "HIFO"
     SECTION_104 = "SECTION_104"
 
@@ -125,6 +126,17 @@ class Transaction(BaseModel):
     realized_pnl: Optional[float] = Field(
         default=None,
         description="Exchange-reported realized PnL for perp closes (quote currency).",
+    )
+    event_subtype: Optional[str] = Field(
+        default=None,
+        description=(
+            "Tax-aware subtype, e.g. lend_deposit, lend_withdraw, hard_fork, "
+            "lp_add, lp_remove."
+        ),
+    )
+    parent_asset: Optional[str] = Field(
+        default=None,
+        description="Parent ticker for hard-fork acquisitions (e.g. ETH for ETHW).",
     )
 
     @field_validator("asset")
@@ -225,6 +237,8 @@ class CgtMatchType(str, Enum):
     THIRTY_DAY = "thirty_day"
     SECTION_104 = "section_104"
     UNMATCHED = "unmatched"
+    # Synthetic row from exchange-reported perp PnL (not share-matched).
+    PERP = "perp"
 
 
 class CgtDisposalRow(BaseModel):

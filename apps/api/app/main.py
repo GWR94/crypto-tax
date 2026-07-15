@@ -18,13 +18,16 @@ _load_dotenv()
 
 import csv
 import io
+import json
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
+from threading import Lock
 from typing import Dict, List, Literal, Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import ingestion
 from .asset_labels import build_asset_labels
@@ -34,10 +37,11 @@ from .config import (
     SUPPORTED_TAX_JURISDICTIONS,
     TAX_JURISDICTION,
     is_stablecoin,
+    reporting_currency_for,
 )
 from .cryptocom import normalize_cryptocom_exchange_legs
 from .display import build_portfolio_summary
-from .fx import fx
+from .fx import fx, us_calendar_year
 from .hmrc_cgt_engine import calculate_uk_cgt, calculate_uk_income, compute_uk_open_pools
 from .uk_tax_year import available_tax_year_labels, uk_tax_year_range
 from .ledger_normalize import normalize_tax_ledger
@@ -61,6 +65,12 @@ from .solana_lending import normalize_lending_protocols
 from .mexc_email import parse_mexc_emails, transactions_to_csv
 from .liquid_staking import normalize_liquid_staking
 from .perps import build_perps_summary
+from .perp_tax import (
+    build_perp_tax_summary,
+    merge_perp_into_realized_pnl_by_asset,
+    merge_perp_into_uk_cgt,
+    merge_perp_into_us_realized,
+)
 from .wallet_detect import CHAIN_LABELS
 from .price_resolver import merge_price_maps, resolve_prices
 from .schemas import (
@@ -174,7 +184,7 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "Local, self-hosted crypto portfolio PnL and capital-gains tax engine "
-        "with deterministic FIFO/HIFO accounting."
+        "with deterministic FIFO/LIFO/HIFO accounting."
     ),
 )
 
@@ -223,7 +233,7 @@ def health() -> Dict[str, object]:
         "status": "ok",
         "service": "crypto-tax-dashboard",
         "parsers": ["generic", "kraken", "exchange_ledger", "cosmos_wallet", "cryptocom", "solana_wallet"],
-        "reporting_currency": REPORTING_CURRENCY,
+        "reporting_currency": reporting_currency_for(state.tax_jurisdiction()),
         "display_currencies": sorted(SUPPORTED_DISPLAY_CURRENCIES),
         "tax_jurisdiction": state.tax_jurisdiction(),
         "supported_tax_jurisdictions": sorted(SUPPORTED_TAX_JURISDICTIONS),
@@ -250,23 +260,38 @@ def health() -> Dict[str, object]:
 
 # --- Transactions ----------------------------------------------------------
 
+# Serialise normalize+persist so parallel dashboard fetches (portfolio +
+# transactions) cannot race on the first post-import read.
+_ledger_normalize_lock = Lock()
+
 
 def _normalize_ledger(txs: List[Transaction]) -> tuple[List[Transaction], bool]:
     """Apply read-time ledger fixes; return (transactions, changed)."""
     return normalize_tax_ledger(txs)
 
 
+def _ensure_normalized_active_ledger() -> List[Transaction]:
+    """Return the active ledger after tax normalization (persist when live).
+
+    Import commits only run a subset of normalizers. Full ``normalize_tax_ledger``
+    (LP / lending tax / hard forks / fee FMV / …) historically ran only on
+    ``GET /transactions``. Portfolio and tax endpoints must use the same view.
+    """
+    with _ledger_normalize_lock:
+        if is_demo_mode():
+            txs, _ = _normalize_ledger(active_transactions())
+            return txs
+
+        prior = state.transactions()
+        txs, changed = _normalize_ledger(prior)
+        if changed:
+            state.replace_all(txs)
+        return without_sample(txs)
+
+
 @app.get("/api/transactions", response_model=List[Transaction])
 def list_transactions() -> List[Transaction]:
-    if is_demo_mode():
-        txs, _ = _normalize_ledger(active_transactions())
-        return txs
-
-    prior = state.transactions()
-    txs, changed = _normalize_ledger(prior)
-    if changed:
-        state.replace_all(txs)
-    return without_sample(txs)
+    return _ensure_normalized_active_ledger()
 
 
 @app.get("/api/asset-labels")
@@ -553,7 +578,7 @@ def list_import_overlaps() -> List[ImportOverlapView]:
 @app.get("/api/data-health", response_model=DataHealthSummary)
 def data_health() -> DataHealthSummary:
     """Scan for orphaned inflows and return saved manual cost-basis overrides."""
-    spot_txs = spot_transactions(active_transactions())
+    spot_txs = spot_transactions(_ensure_normalized_active_ledger())
     overrides = active_cost_basis_overrides()
     return build_data_health_summary(spot_txs, overrides)
 
@@ -1388,11 +1413,33 @@ def strip_demo_transactions() -> Dict[str, object]:
     }
 
 
+@app.get("/api/transactions/backup")
+def download_ledger_backup() -> Response:
+    """Download a JSON backup of the live ledger (and cost-basis overrides)."""
+    payload = state.build_backup_payload()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"crypto-tax-ledger-backup-{stamp}.json"
+    body = json.dumps(payload, indent=2, default=str)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.post("/api/transactions/reset")
-def reset_transactions() -> Dict[str, int]:
+def reset_transactions(
+    backup: bool = Query(
+        True,
+        description="Write data/ledger.json.bak before replacing with the sample ledger.",
+    ),
+) -> Dict[str, object]:
     registry.clear()
-    state.reset_to_sample()
-    return {"total": len(state.transactions())}
+    bak = state.reset_to_sample(backup=backup)
+    return {
+        "total": len(state.transactions()),
+        "local_backup": str(bak) if bak else None,
+    }
 
 
 # --- Internal transfer matching -------------------------------------------
@@ -1446,7 +1493,11 @@ def fix_movements() -> Dict[str, object]:
 
 @app.post("/api/transactions/match-transfers", response_model=TransferMatchResult)
 def match_transfers(persist: bool = Query(True)) -> TransferMatchResult:
-    """Detect and reclassify cross-ledger internal transfers as non-taxable."""
+    """Reclassify mis-typed cross-ledger SELL+BUY pairs as paired TRANSFERs.
+
+    Only matches when both legs have sources, lack market-trade markers
+    (counter asset / order type), and fall within a short time window.
+    """
     txs = state.transactions()
     updated, reclassified = match_internal_transfers(txs)
     if persist and reclassified:
@@ -1497,9 +1548,10 @@ def delete_transaction(transaction_id: str) -> Dict[str, bool]:
 
 @app.get("/api/settings")
 def get_settings() -> Dict[str, str]:
+    jurisdiction = state.tax_jurisdiction()
     return {
-        "tax_jurisdiction": state.tax_jurisdiction(),
-        "reporting_currency": REPORTING_CURRENCY,
+        "tax_jurisdiction": jurisdiction,
+        "reporting_currency": reporting_currency_for(jurisdiction),
         "uk_perp_treatment": state.perp_treatment("UK"),
         "us_perp_treatment": state.perp_treatment("US"),
         "data_mode": state.data_mode(),
@@ -1571,27 +1623,35 @@ def _portfolio_price_maps(
 ) -> tuple[Dict[str, float], Dict[str, object]]:
     """Resolve live + fallback USD prices for all open holdings."""
     jurisdiction = tax_jurisdiction.upper()
+    reporting_currency = reporting_currency_for(jurisdiction)
     cost_basis_usd: Dict[str, float] = {}
 
     if jurisdiction == "UK":
         pools = compute_uk_open_pools(transactions)
         assets = list(pools.keys())
-        for asset, (quantity, invested_gbp) in pools.items():
-            if quantity > 0 and invested_gbp > 0:
-                avg_gbp = invested_gbp / quantity
+        for asset, (quantity, invested) in pools.items():
+            if quantity > 0 and invested > 0:
+                avg = invested / quantity
                 cost_basis_usd[asset] = fx.convert(
-                    avg_gbp, REPORTING_CURRENCY, "USD", datetime.now(timezone.utc)
+                    avg, reporting_currency, "USD", datetime.now(timezone.utc)
                 )
     else:
-        result = _run_engine(transactions, method)
+        result = _run_engine(
+            transactions, method, reporting_currency=reporting_currency
+        )
         assets = list(result.open_lots.keys())
         for asset, lots in result.open_lots.items():
-            quantity = sum(lot.quantity for lot in lots)
-            invested_gbp = sum(lot.remaining_cost_basis for lot in lots)
-            if quantity > 0 and invested_gbp > 0:
-                avg_gbp = invested_gbp / quantity
-                cost_basis_usd[asset] = fx.convert(
-                    avg_gbp, REPORTING_CURRENCY, "USD", datetime.now(timezone.utc)
+            quantity = float(sum((lot.quantity for lot in lots), Decimal("0")))
+            invested = sum(lot.remaining_cost_basis for lot in lots)
+            if quantity > 0 and invested > 0:
+                avg = invested / quantity
+                # US lots are already in USD.
+                cost_basis_usd[asset] = (
+                    avg
+                    if reporting_currency == "USD"
+                    else fx.convert(
+                        avg, reporting_currency, "USD", datetime.now(timezone.utc)
+                    )
                 )
 
     resolved = resolve_prices(
@@ -1605,10 +1665,71 @@ def _portfolio_price_maps(
 
 def _spot_tax_ledger(*, exclude_staking: bool = False) -> List[Transaction]:
     """Spot ledger with manual cost-basis overrides applied for tax math."""
-    txs = spot_transactions(active_transactions())
+    txs = spot_transactions(_ensure_normalized_active_ledger())
     if exclude_staking:
         txs = filter_exclude_staking(txs)
     return prepare_tax_ledger(txs, active_cost_basis_overrides())
+
+
+def _uk_cgt_report(tax_year_label: Optional[str] = None) -> UkCgtSummary:
+    """UK CGT summary, folding perp PnL when treatment is capital_gains."""
+    ledger = _ensure_normalized_active_ledger()
+    report = calculate_uk_cgt(
+        prepare_tax_ledger(
+            spot_transactions(ledger), active_cost_basis_overrides()
+        ),
+        tax_year_label=tax_year_label,
+    )
+    return merge_perp_into_uk_cgt(
+        report,
+        ledger,
+        state.perp_treatment("UK"),
+    )
+
+
+def _us_realized_report(
+    method: AccountingMethod,
+    tax_year: Optional[int] = None,
+) -> RealizedGainsSummary:
+    """US Form 8949 summary, folding perp PnL when treatment is capital_gains."""
+    ledger = _ensure_normalized_active_ledger()
+    report = calculate_realized_gains(
+        prepare_tax_ledger(
+            spot_transactions(ledger), active_cost_basis_overrides()
+        ),
+        method,
+        tax_year=tax_year,
+        tax_jurisdiction="US",
+    )
+    return merge_perp_into_us_realized(
+        report,
+        ledger,
+        state.perp_treatment("US"),
+    )
+
+
+def _portfolio_realized_gain(
+    tax_txs: List[Transaction],
+    accounting: AccountingMethod,
+    jurisdiction: str,
+    ledger: List[Transaction],
+) -> float:
+    """Lifetime realized gain including capital-gains-treated perps."""
+    if jurisdiction.upper() == "UK":
+        return merge_perp_into_uk_cgt(
+            calculate_uk_cgt(tax_txs, tax_year_label=None),
+            ledger,
+            state.perp_treatment("UK"),
+        ).net_gain
+
+    report = calculate_realized_gains(
+        tax_txs, accounting, tax_year=None, tax_jurisdiction=jurisdiction
+    )
+    return merge_perp_into_us_realized(
+        report,
+        ledger,
+        state.perp_treatment(jurisdiction),
+    ).total_gain
 
 
 @app.get("/api/portfolio", response_model=PortfolioSummary)
@@ -1634,7 +1755,7 @@ def portfolio(
             detail=f"Unsupported display currency: {display_currency}",
         )
 
-    txs = active_transactions()
+    txs = _ensure_normalized_active_ledger()
     spot_txs = spot_transactions(txs)
     if exclude_staking:
         spot_txs = filter_exclude_staking(spot_txs)
@@ -1661,8 +1782,8 @@ def portfolio(
     positions = [p for p in positions if _visible_asset(p.asset)]
     all_holdings = [p for p in all_holdings if _visible_asset(p.asset)]
     missing = [m for m in missing if _visible_asset(m.asset)]
-    realized = calculate_realized_gains(
-        tax_txs, accounting, tax_year=None, tax_jurisdiction=jurisdiction
+    total_realized = _portfolio_realized_gain(
+        tax_txs, accounting, jurisdiction, txs
     )
 
     # Stablecoins are cash — keep them in total value but hide from PnL views.
@@ -1675,6 +1796,12 @@ def portfolio(
     harvest = build_tax_harvest_matrix(tradable_for_harvest)
     realized_by_asset = calculate_realized_pnl_by_asset(
         tax_txs, accounting, tax_jurisdiction=jurisdiction
+    )
+    realized_by_asset = merge_perp_into_realized_pnl_by_asset(
+        realized_by_asset,
+        txs,
+        jurisdiction=jurisdiction,
+        treatment=state.perp_treatment(jurisdiction),
     )
     realized_by_asset = [r for r in realized_by_asset if _visible_asset(r.asset)]
 
@@ -1727,9 +1854,10 @@ def portfolio(
         total_value=total_value,
         total_invested=total_invested,
         total_unrealized=total_unrealized,
-        total_realized=realized.total_gain,
+        total_realized=total_realized,
         display_currency=display_currency,
         tax_jurisdiction=jurisdiction,
+        reporting_currency=reporting_currency_for(jurisdiction),
         perps_reporting=perps_summary,
     )
 
@@ -1749,7 +1877,7 @@ def pnl_breakdown(
         if jurisdiction == "UK"
         else _resolve_method(method)
     )
-    spot_txs = spot_transactions(active_transactions())
+    spot_txs = spot_transactions(_ensure_normalized_active_ledger())
     if exclude_staking:
         spot_txs = filter_exclude_staking(spot_txs)
     tax_txs = prepare_tax_ledger(spot_txs, active_cost_basis_overrides())
@@ -1779,16 +1907,10 @@ def tax_report(
     ),
     method: str = Query("FIFO"),
 ) -> UkCgtSummary | RealizedGainsSummary:
-    tax_txs = _spot_tax_ledger()
     if _uk_jurisdiction():
-        return calculate_uk_cgt(tax_txs, tax_year_label=year)
+        return _uk_cgt_report(tax_year_label=year)
     accounting = _resolve_method(method)
-    return calculate_realized_gains(
-        tax_txs,
-        accounting,
-        tax_year=int(year),
-        tax_jurisdiction=state.tax_jurisdiction(),
-    )
+    return _us_realized_report(accounting, tax_year=int(year))
 
 
 @app.get("/api/tax-report/income", response_model=UkIncomeSummary)
@@ -1797,7 +1919,7 @@ def tax_report_income(
 ) -> UkIncomeSummary:
     """Crypto income (airdrops, staking) for a UK tax year, valued in GBP."""
     return calculate_uk_income(
-        spot_transactions(active_transactions()), tax_year_label=year
+        spot_transactions(_ensure_normalized_active_ledger()), tax_year_label=year
     )
 
 
@@ -1806,7 +1928,7 @@ def available_years() -> List[str] | List[int]:
     timestamps = [t.timestamp for t in active_transactions()]
     if _uk_jurisdiction():
         return available_tax_year_labels(timestamps)
-    return sorted({ts.year for ts in timestamps}, reverse=True)
+    return sorted({us_calendar_year(ts) for ts in timestamps}, reverse=True)
 
 
 @app.get("/api/tax-report/perps", response_model=PerpTaxSummary)
@@ -1820,7 +1942,7 @@ def tax_report_perps(
     jurisdiction = state.tax_jurisdiction()
     treatment = state.perp_treatment(jurisdiction)
     return build_perp_tax_summary(
-        active_transactions(),
+        _ensure_normalized_active_ledger(),
         jurisdiction=jurisdiction,
         treatment=treatment,
         period_label=year,
@@ -1842,7 +1964,7 @@ def _safe_year_slug(year: str) -> str:
 
 def _download_uk_cgt(year: str) -> StreamingResponse:
     """Disposal detail (with HMRC match type) plus an SA108-ready summary."""
-    report = calculate_uk_cgt(_spot_tax_ledger(), tax_year_label=year)
+    report = _uk_cgt_report(tax_year_label=year)
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -1892,7 +2014,9 @@ def _download_uk_cgt(year: str) -> StreamingResponse:
 
 def _download_uk_income(year: str) -> StreamingResponse:
     """Crypto income (airdrops, staking) schedule — miscellaneous income, not CGT."""
-    income = calculate_uk_income(spot_transactions(active_transactions()), tax_year_label=year)
+    income = calculate_uk_income(
+        spot_transactions(_ensure_normalized_active_ledger()), tax_year_label=year
+    )
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -1919,9 +2043,7 @@ def _download_uk_income(year: str) -> StreamingResponse:
 
 def _download_us_form_8949(year: str, method: str) -> StreamingResponse:
     accounting = _resolve_method(method)
-    report = calculate_realized_gains(
-        _spot_tax_ledger(), accounting, tax_year=int(year)
-    )
+    report = _us_realized_report(accounting, tax_year=int(year))
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -1930,9 +2052,9 @@ def _download_us_form_8949(year: str, method: str) -> StreamingResponse:
             "Description (Form 8949, Col a)",
             "Date Acquired (Col b)",
             "Date Sold (Col c)",
-            "Proceeds (Col d)",
-            "Cost Basis (Col e)",
-            "Gain/Loss (Col h)",
+            "Proceeds USD (Col d)",
+            "Cost Basis USD (Col e)",
+            "Gain/Loss USD (Col h)",
             "Term",
             "Holding Days",
             "Missing Cost Basis",
@@ -1954,7 +2076,7 @@ def _download_us_form_8949(year: str, method: str) -> StreamingResponse:
         )
 
     writer.writerow([])
-    writer.writerow(["SUMMARY", "", "", "", "", "", "", "", ""])
+    writer.writerow(["SUMMARY (USD)", "", "", "", "", "", "", "", ""])
     writer.writerow(
         [
             "Short-Term",
@@ -1984,6 +2106,7 @@ def _download_us_form_8949(year: str, method: str) -> StreamingResponse:
     writer.writerow(
         ["Total Gain/Loss", "", "", "", "", f"{report.total_gain:.2f}", "", "", ""]
     )
+    writer.writerow(["Reporting currency", report.reporting_currency])
 
     return _csv_response(buffer, f"form_8949_{year}_{accounting.value}.csv")
 
@@ -1993,7 +2116,7 @@ def _download_perp_tax(year: str) -> StreamingResponse:
     jurisdiction = state.tax_jurisdiction()
     treatment = state.perp_treatment(jurisdiction)
     report = build_perp_tax_summary(
-        active_transactions(),
+        _ensure_normalized_active_ledger(),
         jurisdiction=jurisdiction,
         treatment=treatment,
         period_label=year,
@@ -2001,7 +2124,7 @@ def _download_perp_tax(year: str) -> StreamingResponse:
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["Date", "Contract", "Source", "Realized PnL (GBP)", "Fee (GBP)"])
+    writer.writerow(["Date", "Contract", "Source", f"Realized PnL ({report.reporting_currency})", f"Fee ({report.reporting_currency})"])
     for row in report.rows:
         writer.writerow(
             [

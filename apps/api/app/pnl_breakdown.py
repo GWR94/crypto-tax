@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Tuple
 
-from .config import TAX_JURISDICTION, is_stablecoin
+from .config import TAX_JURISDICTION, is_stablecoin, reporting_currency_for
+from .money import LOT_EPS, as_float_qty
 from .schemas import (
     AccountingMethod,
     AssetPnlDetail,
@@ -15,7 +16,6 @@ from .schemas import (
     Transaction,
 )
 from .tax_engine import (
-    AMOUNT_MATCH_REL_TOL,
     _price_reporting,
     _run_engine,
 )
@@ -63,11 +63,12 @@ def build_pnl_breakdown(
 ) -> PnlBreakdown:
     """Return open-lot and disposal lines grouped by asset."""
     jurisdiction = (tax_jurisdiction or TAX_JURISDICTION).upper()
+    reporting_currency = reporting_currency_for(jurisdiction)
     by_asset: Dict[str, AssetPnlDetail] = {}
     disposal_groups: Dict[Tuple[str, str], PnlRealizedDisposalLine] = {}
 
     if jurisdiction == "UK":
-        from .hmrc_cgt_engine import _all_disposal_rows, compute_uk_open_pools
+        from .hmrc_cgt_engine import _all_disposal_rows, compute_uk_open_pool_details
 
         for row in _all_disposal_rows(transactions):
             if is_stablecoin(row.asset):
@@ -83,10 +84,15 @@ def build_pnl_breakdown(
                 gain_loss=row.gain,
             )
 
-        for asset, (pool_qty, pool_cost) in compute_uk_open_pools(transactions).items():
+        for asset, (pool_qty, pool_cost, acquired_at) in compute_uk_open_pool_details(
+            transactions
+        ).items():
             if is_stablecoin(asset):
                 continue
-            current_price = _price_reporting(float(prices_usd.get(asset, 0.0)))
+            current_price = _price_reporting(
+                float(prices_usd.get(asset, 0.0)),
+                reporting_currency=reporting_currency,
+            )
             current_value = pool_qty * current_price
             detail = by_asset.setdefault(asset, AssetPnlDetail(asset=asset))
             detail.open_lots.append(
@@ -96,12 +102,16 @@ def build_pnl_breakdown(
                     cost_basis=round(pool_cost, 2),
                     current_value=round(current_value, 2),
                     unrealized_pnl=round(current_value - pool_cost, 2),
-                    acquired_at=datetime.now(timezone.utc),
+                    # Section 104 is an average-cost pool; show earliest contributing
+                    # acquisition rather than "now".
+                    acquired_at=acquired_at,
                     is_pooled=True,
                 )
             )
     else:
-        result = _run_engine(transactions, method)
+        result = _run_engine(
+            transactions, method, reporting_currency=reporting_currency
+        )
         for row in result.rows:
             if is_stablecoin(row.asset):
                 continue
@@ -119,17 +129,21 @@ def build_pnl_breakdown(
         for asset, lots in result.open_lots.items():
             if is_stablecoin(asset):
                 continue
-            current_price = _price_reporting(float(prices_usd.get(asset, 0.0)))
+            current_price = _price_reporting(
+                float(prices_usd.get(asset, 0.0)),
+                reporting_currency=reporting_currency,
+            )
             detail = by_asset.setdefault(asset, AssetPnlDetail(asset=asset))
             for lot in lots:
-                if lot.quantity <= AMOUNT_MATCH_REL_TOL:
+                if lot.quantity <= LOT_EPS:
                     continue
                 cost = lot.remaining_cost_basis
-                current_value = lot.quantity * current_price
+                qty = as_float_qty(lot.quantity)
+                current_value = qty * current_price
                 detail.open_lots.append(
                     PnlOpenLotLine(
                         transaction_id=lot.source_id,
-                        quantity=round(lot.quantity, 8),
+                        quantity=qty,
                         cost_basis=round(cost, 2),
                         current_value=round(current_value, 2),
                         unrealized_pnl=round(current_value - cost, 2),

@@ -38,7 +38,7 @@ function harvestDescription(jurisdiction: TaxJurisdiction): string {
   return (
     "Tax loss harvesting means selling positions at a loss to realise capital losses that can offset capital gains on your return. " +
     "Potential savings are estimated as the unrealised loss × 20% — a simplified long-term capital gains rate. " +
-    "Your marginal rate may differ. Wash-sale rules do not currently apply to crypto, but FIFO/HIFO determines which lots are sold."
+    "Your marginal rate may differ. Wash-sale rules do not currently apply to crypto, but FIFO/LIFO/HIFO determines which lots are sold."
   );
 }
 

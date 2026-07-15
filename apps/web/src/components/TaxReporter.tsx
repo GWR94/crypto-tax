@@ -30,6 +30,7 @@ const MATCH_LABEL: Record<CgtMatchType, string> = {
   thirty_day: "30-day",
   section_104: "S.104 pool",
   unmatched: "No cost basis",
+  perp: "Perp PnL",
 };
 
 const UK_TERM_HINTS = {
@@ -136,7 +137,7 @@ export function TaxReporter({
           <SectionDescription>
             {isUk
               ? "Build a UK tax-year capital gains summary with HMRC share-matching (same-day, 30-day, then Section 104 pool). Export SA108-ready CSVs for your Self Assessment. Figures are in sterling at historical FX rates on each disposal date."
-              : "Build a calendar-year capital gains report with FIFO or HIFO lot matching. Export Form 8949 / Schedule D CSVs for your return. Figures use USD reporting currency at historical prices."}
+              : "Build a calendar-year capital gains report with FIFO, LIFO, or HIFO lot matching. Export Form 8949 / Schedule D CSVs for your return. Figures use USD reporting currency at historical prices."}
           </SectionDescription>
         </div>
       </CardHeader>
@@ -178,6 +179,7 @@ export function TaxReporter({
                 }
               >
                 <option value="FIFO">FIFO (First-In, First-Out)</option>
+                <option value="LIFO">LIFO (Last-In, First-Out)</option>
                 <option value="HIFO">HIFO (Highest-In, First-Out)</option>
               </Select>
             </div>
@@ -264,7 +266,11 @@ function PerpReportView({ report }: { report: PerpTaxSummary }) {
         Exchange-reported perp PnL for {report.period_label ?? "all periods"},
         converted to <strong className="text-foreground">{ccy}</strong>. Reported
         as {isCapital ? "capital gains" : "trading/ordinary income"} per your
-        settings — this is configurable and not tax advice.
+        settings
+        {isCapital
+          ? " — these amounts are also included in the CGT / Form 8949 totals above"
+          : ""}
+        . Configurable and not tax advice.
       </p>
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Summary label="Net PnL" value={report.net_pnl} currency={ccy} emphasize />
@@ -376,7 +382,9 @@ function UkReportView({ report }: { report: UkCgtSummary }) {
                             ? UK_TERM_HINTS.matchThirtyDay
                             : row.match_type === "section_104"
                               ? UK_TERM_HINTS.matchSection104
-                              : UK_TERM_HINTS.matchUnmatched
+                              : row.match_type === "perp"
+                                ? "Exchange-reported perpetual futures PnL treated as capital gains (not share-matched with spot)."
+                                : UK_TERM_HINTS.matchUnmatched
                       }
                     >
                       {MATCH_LABEL[row.match_type]}

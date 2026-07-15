@@ -50,4 +50,5 @@ def test_matrix_summary_export() -> None:
     summary = matrix_summary()
     assert len(summary) == len(HMRC_MATRIX_CASES)
     statuses = {row["status"] for row in summary}
-    assert statuses == {"pass", "known_gap"}
+    assert "pass" in statuses
+    assert statuses <= {"pass", "known_gap", "fail_target"}

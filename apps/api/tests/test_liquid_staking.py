@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from app.liquid_staking import (
     collapse_lst_transfer_sell_duplicates,
@@ -177,7 +178,7 @@ def test_yield_split_open_lots_match_received_sol():
     ]
     fixed, _ = split_lst_staking_income(txs)
     result = _run_engine(fixed, AccountingMethod.FIFO)
-    sol_qty = sum(lot.quantity for lot in result.open_lots.get("SOL", []))
+    sol_qty = float(sum((lot.quantity for lot in result.open_lots.get("SOL", [])), Decimal("0")))
     assert abs(sol_qty - 1.1) < 1e-9
 
 

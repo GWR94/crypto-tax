@@ -32,11 +32,13 @@ _EARN_DEPOSIT_MARKERS = (
 )
 _EARN_WITHDRAWAL_MARKERS = ("crypto_earn_program_withdrawn",)
 
-# The inbound amount is the outbound amount less a network fee. Allow the
-# inbound leg to be up to 10% smaller (covers fees on small transfers) and a
-# hair larger to absorb rounding.
-PAIR_LOWER_RATIO = 0.90
+# The inbound amount is the outbound amount less a network / withdrawal fee.
+# Prefer a tight relative band; allow a tiny absolute dust floor for small
+# transfers; never pair when the implied fee exceeds the hard cap (was 10%).
 PAIR_UPPER_RATIO = 1.0005
+PAIR_REL_TOL = 0.01  # preferred max fee as a fraction of outbound
+PAIR_REL_HARD_CAP = 0.02  # reject if implied fee exceeds 2%
+PAIR_ABS_DUST = 1e-8  # absolute dust floor for tiny transfers
 
 
 def _candidate_score(out_tx: Transaction, in_tx: Transaction) -> float:
@@ -47,11 +49,18 @@ def _candidate_score(out_tx: Transaction, in_tx: Transaction) -> float:
 
 
 def _amounts_compatible(out_amount: float, in_amount: float) -> bool:
+    """True when inbound is outbound less an allowable network fee."""
     if out_amount <= 0 or in_amount <= 0:
         return False
-    lower = out_amount * PAIR_LOWER_RATIO
-    upper = out_amount * PAIR_UPPER_RATIO
-    return lower <= in_amount <= upper
+    if in_amount > out_amount * PAIR_UPPER_RATIO:
+        return False
+    fee = out_amount - in_amount
+    if fee <= 0:
+        return True
+    fee_ratio = fee / out_amount
+    if fee_ratio > PAIR_REL_HARD_CAP:
+        return False
+    return fee <= max(out_amount * PAIR_REL_TOL, PAIR_ABS_DUST)
 
 
 def _record_pair(

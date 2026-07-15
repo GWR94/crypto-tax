@@ -170,8 +170,13 @@ def test_kraken_micro_btc_sells_without_buys_become_fees():
     fees = [t for t in txs if t.transaction_type == TransactionType.FEE and t.asset == "BTC"]
     assert len(fees) == 2
     assert fees[0].fee_fiat == 0.0
+    # Native FEE rows are HMRC disposals. With no BTC purchase history they are
+    # correctly flagged as unmatched. Same-day FEEs collapse to one disposal.
     missing = compute_uk_missing_cost_basis(spot_transactions(txs))
-    assert not any(m.asset == "BTC" for m in missing)
+    btc_missing = [m for m in missing if m.asset == "BTC"]
+    assert len(btc_missing) == 1
+    assert btc_missing[0].disposal_id == "+".join(f.id for f in fees)
+    assert abs(btc_missing[0].disposed_amount - sum(f.amount for f in fees)) < 1e-12
 
 
 def test_kraken_spend_with_fiat_notional_stays_sell():

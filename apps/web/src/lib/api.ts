@@ -157,10 +157,34 @@ export const api = {
     );
   },
 
-  resetTransactions(): Promise<{ total: number }> {
-    return request<{ total: number }>("/transactions/reset", {
-      method: "POST",
-    });
+  async downloadLedgerBackup(): Promise<string> {
+    const res = await fetch(`${BASE}/transactions/backup`);
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(formatApiError(detail || res.statusText, res.status));
+    }
+    const disposition = res.headers.get("Content-Disposition") ?? "";
+    const match = /filename="([^"]+)"/i.exec(disposition);
+    const filename =
+      match?.[1] ??
+      `crypto-tax-ledger-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    return filename;
+  },
+
+  resetTransactions(): Promise<{ total: number; local_backup: string | null }> {
+    return request<{ total: number; local_backup: string | null }>(
+      "/transactions/reset",
+      { method: "POST" }
+    );
   },
 
   getAvailableYears(): Promise<Array<string | number>> {

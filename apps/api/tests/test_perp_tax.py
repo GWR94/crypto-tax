@@ -107,6 +107,143 @@ def test_perp_income_schedule_uk_tax_year():
     assert summary.losses < 0
 
 
+def test_perp_exclude_returns_empty_schedule():
+    txs = [
+        _perp(
+            "s1",
+            "2024-05-01T00:00:00",
+            TransactionType.SELL,
+            1.0,
+            30000.0,
+            realized_pnl=200.0,
+        ),
+    ]
+    summary = build_perp_tax_summary(
+        txs, jurisdiction="US", treatment="exclude", period_label="2024"
+    )
+    assert summary.event_count == 0
+    assert summary.net_pnl == 0.0
+
+
+def test_capital_gains_treatment_folds_into_uk_cgt():
+    from app.perp_tax import merge_perp_into_uk_cgt
+
+    spot = [
+        Transaction(
+            id="spot-buy",
+            timestamp=datetime.fromisoformat("2024-04-10T00:00:00").replace(
+                tzinfo=timezone.utc
+            ),
+            asset="ETH",
+            transaction_type=TransactionType.BUY,
+            amount=1.0,
+            fiat_value_at_trigger=1000.0,
+            fiat_currency="GBP",
+            source="kraken",
+        ),
+        Transaction(
+            id="spot-sell",
+            timestamp=datetime.fromisoformat("2024-05-10T00:00:00").replace(
+                tzinfo=timezone.utc
+            ),
+            asset="ETH",
+            transaction_type=TransactionType.SELL,
+            amount=1.0,
+            fiat_value_at_trigger=1500.0,
+            fiat_currency="GBP",
+            source="kraken",
+        ),
+    ]
+    perps = [
+        _perp(
+            "perp-win",
+            "2024-06-01T00:00:00",
+            TransactionType.SELL,
+            1.0,
+            0.0,
+            realized_pnl=200.0,
+            fee=0.0,
+        ),
+    ]
+    # Force GBP reporting path: treat realized_pnl currency as GBP via fiat_currency.
+    perps[0] = perps[0].model_copy(update={"fiat_currency": "GBP"})
+
+    base = calculate_uk_cgt(spot, tax_year_label="2024/25")
+    assert base.net_gain == 500.0
+    assert all(r.match_type.value != "perp" for r in base.rows)
+
+    income = merge_perp_into_uk_cgt(base, spot + perps, "income")
+    assert income.net_gain == 500.0
+
+    folded = merge_perp_into_uk_cgt(base, spot + perps, "capital_gains")
+    assert folded.net_gain == 700.0
+    perp_rows = [r for r in folded.rows if r.match_type.value == "perp"]
+    assert len(perp_rows) == 1
+    assert perp_rows[0].asset.startswith("PERP:")
+    assert perp_rows[0].gain == 200.0
+    # Spot BTC/ETH pools must stay untouched by raw perp fills.
+    assert calculate_uk_cgt(spot + perps, tax_year_label="2024/25").net_gain == 500.0
+
+
+def test_capital_gains_treatment_folds_into_us_form_8949():
+    from app.perp_tax import merge_perp_into_us_realized
+
+    spot = [
+        Transaction(
+            id="spot-buy",
+            timestamp=datetime.fromisoformat("2024-01-01T00:00:00").replace(
+                tzinfo=timezone.utc
+            ),
+            asset="ETH",
+            transaction_type=TransactionType.BUY,
+            amount=1.0,
+            fiat_value_at_trigger=1000.0,
+            fiat_currency="USD",
+            source="coinbase",
+        ),
+        Transaction(
+            id="spot-sell",
+            timestamp=datetime.fromisoformat("2024-06-01T00:00:00").replace(
+                tzinfo=timezone.utc
+            ),
+            asset="ETH",
+            transaction_type=TransactionType.SELL,
+            amount=1.0,
+            fiat_value_at_trigger=1500.0,
+            fiat_currency="USD",
+            source="coinbase",
+        ),
+    ]
+    perps = [
+        _perp(
+            "perp-loss",
+            "2024-07-01T00:00:00",
+            TransactionType.SELL,
+            2.0,
+            0.0,
+            realized_pnl=-80.0,
+            fee=20.0,
+        ),
+    ]
+
+    base = calculate_realized_gains(
+        spot, AccountingMethod.FIFO, tax_year=2024, tax_jurisdiction="US"
+    )
+    assert base.total_gain == 500.0
+    assert len(base.rows) == 1
+
+    folded = merge_perp_into_us_realized(base, spot + perps, "capital_gains")
+    # Net perp = -80 - 20 = -100
+    assert folded.total_gain == 400.0
+    assert len(folded.rows) == 2
+    perp_row = next(r for r in folded.rows if r.lot_source_id == "PERP")
+    assert perp_row.asset.startswith("PERP:")
+    assert perp_row.term == "SHORT"
+    assert perp_row.gain_loss == -100.0
+    assert perp_row.proceeds == 0.0
+    assert perp_row.cost_basis == 100.0
+
+
 def test_available_perp_periods():
     txs = [
         _perp("s1", "2024-05-01T00:00:00", TransactionType.SELL, 1.0, 30000.0, realized_pnl=10.0),

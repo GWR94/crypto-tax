@@ -1,4 +1,4 @@
-"""Convert reporting-currency (GBP) portfolio figures to dashboard display currency."""
+"""Convert tax-reporting portfolio figures to dashboard display currency."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ from .schemas import (
 )
 
 
-def _resolve_display(display: str) -> str:
+def _resolve_display(display: str, *, reporting_currency: str) -> str:
     code = display.upper()
     if code not in SUPPORTED_DISPLAY_CURRENCIES:
-        return REPORTING_CURRENCY
+        return reporting_currency
     return code
 
 
@@ -41,17 +41,31 @@ def build_portfolio_summary(
     total_realized: float,
     display_currency: str,
     tax_jurisdiction: str,
+    reporting_currency: str = REPORTING_CURRENCY,
     perps_reporting: PerpsSummary | None = None,
 ) -> PortfolioSummary:
-    """Map GBP reporting amounts to the requested dashboard display currency."""
-    display = _resolve_display(display_currency)
+    """Map tax-reporting amounts to the requested dashboard display currency."""
+    reporting_currency = reporting_currency.upper()
+    display = _resolve_display(
+        display_currency, reporting_currency=reporting_currency
+    )
 
     def d_money(value: float) -> float:
-        return round(fx.reporting_to_display(value, display), 2)
+        return round(
+            fx.reporting_to_display(
+                value, display, reporting_currency=reporting_currency
+            ),
+            2,
+        )
 
     def d_unit(value: float) -> float:
         """Per-coin unit prices need more precision than portfolio totals."""
-        return round(fx.reporting_to_display(value, display), 4)
+        return round(
+            fx.reporting_to_display(
+                value, display, reporting_currency=reporting_currency
+            ),
+            4,
+        )
 
     positions = [
         Position(
@@ -138,7 +152,7 @@ def build_portfolio_summary(
         realized_pnl=realized_pnl,
         missing_cost_basis=missing,
         method=method,
-        reporting_currency=REPORTING_CURRENCY,
+        reporting_currency=reporting_currency,
         display_currency=display,
         tax_jurisdiction=tax_jurisdiction.upper(),
         perps=perps,

@@ -1,7 +1,11 @@
 """Foreign-exchange conversion with historical rates and local caching.
 
 Rates are fetched from the Frankfurter API (ECB data, no API key). Converted
-amounts feed the tax engine in :data:`REPORTING_CURRENCY` (GBP).
+amounts feed the tax engine in the jurisdiction reporting currency (GBP for
+UK, USD for US Form 8949).
+
+FX rate days align with tax calendar conventions: Europe/London for GBP
+reporting (HMRC), UTC for USD reporting (Form 8949).
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from .config import REPORTING_CURRENCY, STABLECOIN_ASSETS
 
@@ -39,6 +43,33 @@ _CACHE_DIR = Path(
     )
 )
 _CACHE_FILE = _CACHE_DIR / "fx_cache.json"
+
+
+def fx_calendar_day(
+    when: datetime | date,
+    *,
+    reporting_currency: Optional[str] = None,
+) -> date:
+    """Calendar day used to look up the historical FX rate.
+
+    UK (GBP) reporting uses Europe/London dates so conversion matches HMRC
+    same-day / tax-year boundaries. US (USD) reporting uses the UTC date.
+    """
+    if isinstance(when, date) and not isinstance(when, datetime):
+        return when
+    to_ccy = (reporting_currency or REPORTING_CURRENCY).upper()
+    if to_ccy == "GBP":
+        from .uk_tax_year import uk_calendar_date
+
+        return uk_calendar_date(when)
+    if when.tzinfo is None:
+        return when.date()
+    return when.astimezone(timezone.utc).date()
+
+
+def us_calendar_year(value: datetime | date) -> int:
+    """US Form 8949 / calendar-year bucket for a timestamp (UTC date)."""
+    return fx_calendar_day(value, reporting_currency="USD").year
 
 
 class FxService:
@@ -120,10 +151,14 @@ class FxService:
         from_ccy: str,
         to_ccy: str,
         when: datetime | date,
+        *,
+        reporting_currency: Optional[str] = None,
     ) -> float:
         if amount == 0:
             return 0.0
-        day = when.date() if isinstance(when, datetime) else when
+        # When converting into a reporting currency, use that currency's tax day.
+        day_ccy = (reporting_currency or to_ccy).upper()
+        day = fx_calendar_day(when, reporting_currency=day_ccy)
         rate = self.get_rate(from_ccy, to_ccy, day)
         return amount * rate
 
@@ -133,18 +168,40 @@ class FxService:
         currency: Optional[str],
         when: datetime,
         source: Optional[str] = None,
+        *,
+        reporting_currency: Optional[str] = None,
     ) -> float:
-        """Convert a transaction amount into the reporting currency (GBP)."""
+        """Convert a transaction amount into the tax reporting currency."""
         from_ccy = self.resolve_currency(currency, source)
-        return self.convert(amount, from_ccy, REPORTING_CURRENCY, when)
+        to_ccy = (reporting_currency or REPORTING_CURRENCY).upper()
+        return self.convert(
+            amount,
+            from_ccy,
+            to_ccy,
+            when,
+            reporting_currency=to_ccy,
+        )
 
-    def reporting_to_display(self, amount_gbp: float, display_ccy: str) -> float:
-        """Convert a GBP reporting amount to the dashboard display currency."""
+    def reporting_to_display(
+        self,
+        amount: float,
+        display_ccy: str,
+        *,
+        reporting_currency: Optional[str] = None,
+    ) -> float:
+        """Convert a tax-reporting amount to the dashboard display currency."""
+        from_ccy = (reporting_currency or REPORTING_CURRENCY).upper()
         display_ccy = display_ccy.upper()
-        if display_ccy == REPORTING_CURRENCY:
-            return amount_gbp
-        today = datetime.now(timezone.utc).date()
-        return self.convert(amount_gbp, REPORTING_CURRENCY, display_ccy, today)
+        if display_ccy == from_ccy:
+            return amount
+        today = datetime.now(timezone.utc)
+        return self.convert(
+            amount,
+            from_ccy,
+            display_ccy,
+            today,
+            reporting_currency=display_ccy,
+        )
 
 
 # Module singleton used by API + tax engine.
