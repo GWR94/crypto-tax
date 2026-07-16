@@ -17,6 +17,37 @@ def reporting_currency_for(jurisdiction: str | None = None) -> str:
     code = (jurisdiction or TAX_JURISDICTION).strip().upper()
     return "USD" if code == "US" else "GBP"
 
+
+# Illustrative rates for tax-loss-harvesting savings estimates.
+# Not tax advice — configure unused basic band / brackets to match your return.
+#
+# UK CGT on crypto (from 30 Oct 2024): 18% within unused basic-rate band, else 24%.
+# US: short-term = ordinary income; long-term = preferential CG (typical 15%).
+UK_CGT_BASIC_RATE = 0.18
+UK_CGT_HIGHER_RATE = 0.24
+# Default unused basic-rate band (GBP) when the user has not set one.
+# 2026/27 basic-rate band is £37,700 — treat the full band as unused until
+# settings supply taxable-income-adjusted remainder.
+UK_CGT_BASIC_RATE_BAND = 37700.0
+UK_UNUSED_BASIC_BAND_DEFAULT = UK_CGT_BASIC_RATE_BAND
+
+US_ORDINARY_INCOME_RATE = 0.24  # illustrative short-term / ordinary bracket
+US_LONG_TERM_CG_RATE = 0.15  # typical long-term federal CG bracket
+
+# Backward-compatible single-rate map (effective headline for docs / fallbacks).
+TAX_LOSS_HARVEST_RATES = {
+    "UK": UK_CGT_HIGHER_RATE,
+    "US": US_LONG_TERM_CG_RATE,
+}
+
+
+def tax_loss_harvest_rate(jurisdiction: str | None = None) -> float:
+    """Headline illustrative CG rate (UK higher / US LTCG) for simple fallbacks."""
+    code = (jurisdiction or TAX_JURISDICTION).strip().upper()
+    if code not in TAX_LOSS_HARVEST_RATES:
+        code = TAX_JURISDICTION
+    return float(TAX_LOSS_HARVEST_RATES[code])
+
 # How perpetual-futures PnL is treated for tax:
 #   "exclude"       — perps shown for reference only, kept out of every report
 #   "income"        — net realized PnL reported as trading/ordinary income by year

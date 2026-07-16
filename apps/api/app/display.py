@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from typing import List
 
-from .config import REPORTING_CURRENCY, SUPPORTED_DISPLAY_CURRENCIES
+from .config import (
+    REPORTING_CURRENCY,
+    SUPPORTED_DISPLAY_CURRENCIES,
+    UK_CGT_BASIC_RATE,
+    UK_CGT_HIGHER_RATE,
+    UK_UNUSED_BASIC_BAND_DEFAULT,
+    US_LONG_TERM_CG_RATE,
+    US_ORDINARY_INCOME_RATE,
+)
 from .fx import fx
 from .schemas import (
     AccountingMethod,
@@ -43,6 +51,9 @@ def build_portfolio_summary(
     tax_jurisdiction: str,
     reporting_currency: str = REPORTING_CURRENCY,
     perps_reporting: PerpsSummary | None = None,
+    uk_unused_basic_band: float | None = None,
+    us_ordinary_rate: float | None = None,
+    us_ltcg_rate: float | None = None,
 ) -> PortfolioSummary:
     """Map tax-reporting amounts to the requested dashboard display currency."""
     reporting_currency = reporting_currency.upper()
@@ -89,6 +100,10 @@ def build_portfolio_summary(
             current_value=d_money(h.current_value),
             unrealized_loss=d_money(h.unrealized_loss),
             potential_tax_savings=d_money(h.potential_tax_savings),
+            basic_rate_loss=d_money(h.basic_rate_loss),
+            higher_rate_loss=d_money(h.higher_rate_loss),
+            short_term_loss=d_money(h.short_term_loss),
+            long_term_loss=d_money(h.long_term_loss),
         )
         for h in harvest_reporting
     ]
@@ -140,6 +155,25 @@ def build_portfolio_summary(
             losing_closes=perps_reporting.losing_closes,
         )
 
+    jurisdiction = tax_jurisdiction.upper()
+    unused_band = (
+        UK_UNUSED_BASIC_BAND_DEFAULT
+        if uk_unused_basic_band is None
+        else float(uk_unused_basic_band)
+    )
+    ordinary = (
+        US_ORDINARY_INCOME_RATE
+        if us_ordinary_rate is None
+        else float(us_ordinary_rate)
+    )
+    ltcg = US_LONG_TERM_CG_RATE if us_ltcg_rate is None else float(us_ltcg_rate)
+
+    total_loss = sum(h.unrealized_loss for h in harvest)
+    total_savings = sum(h.potential_tax_savings for h in harvest)
+    effective_rate = (total_savings / total_loss) if total_loss > 0 else (
+        UK_CGT_HIGHER_RATE if jurisdiction == "UK" else ltcg
+    )
+
     return PortfolioSummary(
         total_portfolio_value=d_money(total_value),
         total_invested=d_money(total_invested),
@@ -154,6 +188,12 @@ def build_portfolio_summary(
         method=method,
         reporting_currency=reporting_currency,
         display_currency=display,
-        tax_jurisdiction=tax_jurisdiction.upper(),
+        tax_jurisdiction=jurisdiction,
+        tax_harvest_rate=round(effective_rate, 4),
+        tax_harvest_basic_rate=UK_CGT_BASIC_RATE,
+        tax_harvest_higher_rate=UK_CGT_HIGHER_RATE,
+        tax_harvest_ordinary_rate=ordinary,
+        tax_harvest_ltcg_rate=ltcg,
+        tax_harvest_unused_basic_band=unused_band,
         perps=perps,
     )

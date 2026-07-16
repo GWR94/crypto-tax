@@ -21,7 +21,7 @@ CSS and shadcn-style components, with Recharts for visualization.
 - **Executive KPI ribbon**: portfolio value, realized gains, unrealized gains,
   and a crypto income (airdrop/staking) summary.
 - **Tax-loss-harvesting matrix**: only red positions, with potential tax savings
-  at a flat 20% rate.
+  at the jurisdiction's illustrative CG rate (UK higher-rate CGT / US LTCG).
 - **Missing cost-basis alert**: flags sells with no matching purchase history.
 - **Per-coin PnL table** and **portfolio allocation chart**.
 - **Tax Reporter**: pick a year + method and export an IRS Form 8949-structured

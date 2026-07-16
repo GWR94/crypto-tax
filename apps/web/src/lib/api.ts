@@ -55,6 +55,9 @@ export const api = {
     tax_jurisdiction?: TaxJurisdiction;
     uk_perp_treatment?: PerpTreatment;
     us_perp_treatment?: PerpTreatment;
+    uk_unused_basic_band?: number;
+    us_ordinary_income_rate?: number;
+    us_long_term_cg_rate?: number;
   }): Promise<TaxSettings> {
     return request<TaxSettings>("/settings", {
       method: "PATCH",

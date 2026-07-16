@@ -31,10 +31,14 @@ SKIP_ACTIVITY_TYPES = frozenset(
     {
         "ACTIVITY_SPL_CREATE_ACCOUNT",
         "ACTIVITY_SPL_CLOSE_ACCOUNT",
-        "ACTIVITY_SPL_BURN",
-        "ACTIVITY_SPL_MINT",
     }
 )
+
+# Mint/burn activities are kept (not skipped) so an LP position's real receipt
+# (mint) and disposal (burn) legs survive. They are tagged with ``token_change``
+# and only preserved downstream when part of a same-signature LP add/remove.
+BURN_ACTIVITY_TYPES = frozenset({"ACTIVITY_SPL_BURN"})
+MINT_ACTIVITY_TYPES = frozenset({"ACTIVITY_SPL_MINT"})
 
 
 def solscan_api_key() -> Optional[str]:
@@ -240,6 +244,7 @@ def _row(
     value: float = 0.0,
     helius_source: str = "",
     helius_type: str = "",
+    token_change: str = "",
 ) -> dict:
     return {
         "Signature": signature,
@@ -255,6 +260,8 @@ def _row(
         "Multiplier": 1,
         "Helius Source": helius_source,
         "Helius Type": helius_type,
+        # "burn" / "mint" for SPL supply changes (LP receipt/disposal legs).
+        "Token Change": token_change,
     }
 
 
@@ -273,6 +280,19 @@ def solscan_transfers_to_rows(wallet: str, transfers: List[dict]) -> List[dict]:
         from_addr = str(item.get("from_address") or "")
         to_addr = str(item.get("to_address") or "")
         flow = str(item.get("flow") or "").lower()
+
+        # SPL supply changes (LP receipt/disposal) rarely carry a counterparty or
+        # flow — mint credits the wallet, burn debits it.
+        token_change = ""
+        if activity in BURN_ACTIVITY_TYPES:
+            token_change = "burn"
+            flow = "out"
+            from_addr = from_addr or wallet
+        elif activity in MINT_ACTIVITY_TYPES:
+            token_change = "mint"
+            flow = "in"
+            to_addr = to_addr or wallet
+
         if flow not in ("in", "out"):
             if from_addr == wallet:
                 flow = "out"
@@ -302,9 +322,74 @@ def solscan_transfers_to_rows(wallet: str, transfers: List[dict]) -> List[dict]:
                 mint=mint,
                 decimals=decimals,
                 value=value,
+                token_change=token_change,
             )
         )
 
+    return rows
+
+
+def _helius_supply_change_rows(
+    tx: dict,
+    *,
+    wallet: str,
+    signature: str,
+    human_time: str,
+    helius_source: str,
+    helius_type: str,
+    skip_mints: set,
+) -> List[dict]:
+    """Emit LP mint/burn legs from ``accountData[].tokenBalanceChanges``.
+
+    Mints and burns change the wallet's token balance without a matching
+    ``tokenTransfer`` (no counterparty). Net the raw deltas per mint for the
+    wallet owner and emit an in/out leg tagged with ``token_change`` when the
+    mint was not already seen as a regular transfer in this signature.
+    """
+    net_by_mint: Dict[str, int] = {}
+    decimals_by_mint: Dict[str, int] = {}
+
+    for acct in tx.get("accountData") or []:
+        if not isinstance(acct, dict):
+            continue
+        for change in acct.get("tokenBalanceChanges") or []:
+            if not isinstance(change, dict):
+                continue
+            if str(change.get("userAccount") or "") != wallet:
+                continue
+            mint = str(change.get("mint") or "")
+            if not mint or mint in skip_mints:
+                continue
+            raw = change.get("rawTokenAmount") or {}
+            try:
+                delta = int(str(raw.get("tokenAmount")))
+            except (TypeError, ValueError):
+                continue
+            if delta == 0:
+                continue
+            net_by_mint[mint] = net_by_mint.get(mint, 0) + delta
+            decimals_by_mint[mint] = int(raw.get("decimals") or 0)
+
+    rows: List[dict] = []
+    for mint, delta in net_by_mint.items():
+        if delta == 0:
+            continue
+        is_mint = delta > 0
+        rows.append(
+            _row(
+                signature=signature,
+                human_time=human_time,
+                flow="in" if is_mint else "out",
+                from_addr="" if is_mint else wallet,
+                to_addr=wallet if is_mint else "",
+                amount=float(abs(delta)),
+                mint=mint,
+                decimals=decimals_by_mint.get(mint, 0),
+                helius_source=helius_source,
+                helius_type=helius_type,
+                token_change="mint" if is_mint else "burn",
+            )
+        )
     return rows
 
 
@@ -348,6 +433,9 @@ def helius_transactions_to_rows(wallet: str, transactions: List[dict]) -> List[d
                 )
             )
 
+        # Mints already emitted as tagged burn/mint transfers are skipped in the
+        # balance-change pass so we don't double-count the same SPL supply leg.
+        transfer_mints: set[str] = set()
         for transfer in tx.get("tokenTransfers") or []:
             if not isinstance(transfer, dict):
                 continue
@@ -363,6 +451,16 @@ def helius_transactions_to_rows(wallet: str, transactions: List[dict]) -> List[d
                 flow = "in"
             else:
                 continue
+            # Raydium / CPMM LP burns often appear as a transfer with an empty
+            # counterparty (and again in tokenBalanceChanges). Tag them here so
+            # the LP parser sees a real burn even when skip_mints suppresses the
+            # balance-change duplicate.
+            token_change = ""
+            if flow == "out" and not to_addr:
+                token_change = "burn"
+            elif flow == "in" and not from_addr:
+                token_change = "mint"
+            transfer_mints.add(mint)
             rows.append(
                 _row(
                     signature=signature,
@@ -375,8 +473,21 @@ def helius_transactions_to_rows(wallet: str, transactions: List[dict]) -> List[d
                     decimals=0,
                     helius_source=helius_source,
                     helius_type=helius_type,
+                    token_change=token_change,
                 )
             )
+
+        rows.extend(
+            _helius_supply_change_rows(
+                tx,
+                wallet=wallet,
+                signature=signature,
+                human_time=human_time,
+                helius_source=helius_source,
+                helius_type=helius_type,
+                skip_mints=transfer_mints,
+            )
+        )
 
         if helius_source.upper() == "DRIFT":
             wallet_delta = 0

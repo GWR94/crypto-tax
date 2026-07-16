@@ -59,6 +59,9 @@ def is_solana_account_rent(tx: Transaction) -> bool:
 
 def is_dust_transaction(tx: Transaction) -> bool:
     """True for sub-dust amounts or trivial fiat value (matches dashboard ledger filter)."""
+    # LP receipt/burn + pool-underlying legs are priced later — never dust.
+    if tx.venue_order_type in {"amm_lp", "amm_lp_pool"}:
+        return False
     if tx.amount < DUST_AMOUNT:
         return True
     if tx.fiat_value_at_trigger > 0 and tx.fiat_value_at_trigger < DUST_FIAT_VALUE:

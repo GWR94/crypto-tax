@@ -9,6 +9,7 @@ from .cost_basis_overrides import overrides_by_anchor
 from .ledger_filters import DUST_AMOUNT, DUST_FIAT_VALUE
 from .schemas import (
     DataHealthSummary,
+    LpInferenceFlag,
     ManualCostBasisOverride,
     OrphanedInflowFlag,
     Transaction,
@@ -85,12 +86,38 @@ def find_orphaned_inflows(
     return flags
 
 
+def find_lp_inference_notes(
+    transactions: List[Transaction],
+) -> List[LpInferenceFlag]:
+    """Surface LP disposals reconstructed from a missing on-chain burn leg."""
+    flags: List[LpInferenceFlag] = []
+    for tx in sorted(transactions, key=lambda t: t.timestamp):
+        if not tx.normalization_note:
+            continue
+        if tx.event_subtype != "lp_remove":
+            continue
+        flags.append(
+            LpInferenceFlag(
+                transaction_id=tx.id,
+                asset=tx.asset,
+                timestamp=tx.timestamp,
+                quantity=tx.amount,
+                proceeds=tx.fiat_value_at_trigger,
+                ambiguous="verify" in tx.normalization_note.lower(),
+                message=tx.normalization_note,
+            )
+        )
+    return flags
+
+
 def build_data_health_summary(
     transactions: List[Transaction],
     overrides: List[ManualCostBasisOverride],
 ) -> DataHealthSummary:
     orphaned = find_orphaned_inflows(transactions, overrides)
+    lp_notes = find_lp_inference_notes(transactions)
     return DataHealthSummary(
         orphaned_inflows=orphaned,
         cost_basis_overrides=overrides,
+        lp_inference_notes=lp_notes,
     )

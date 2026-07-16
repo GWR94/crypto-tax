@@ -18,6 +18,12 @@ export interface TaxSettings {
   data_mode?: DataMode;
   uk_perp_treatment?: PerpTreatment;
   us_perp_treatment?: PerpTreatment;
+  /** Unused UK basic-rate band (GBP) for harvest CGT banding. */
+  uk_unused_basic_band?: number;
+  /** Illustrative US ordinary / short-term rate (0–1). */
+  us_ordinary_income_rate?: number;
+  /** Illustrative US long-term CG rate (0–1). */
+  us_long_term_cg_rate?: number;
 }
 
 export type DisplayCurrency = "GBP" | "USD";
@@ -127,6 +133,10 @@ export interface TaxHarvestRow {
   current_value: number;
   unrealized_loss: number;
   potential_tax_savings: number;
+  basic_rate_loss?: number;
+  higher_rate_loss?: number;
+  short_term_loss?: number;
+  long_term_loss?: number;
 }
 
 export interface IncomeSummary {
@@ -169,9 +179,20 @@ export interface ManualCostBasisOverride {
   updated_at: string;
 }
 
+export interface LpInferenceFlag {
+  transaction_id: string;
+  asset: string;
+  timestamp: string;
+  quantity: number;
+  proceeds: number;
+  ambiguous: boolean;
+  message: string;
+}
+
 export interface DataHealthSummary {
   orphaned_inflows: OrphanedInflowFlag[];
   cost_basis_overrides: ManualCostBasisOverride[];
+  lp_inference_notes?: LpInferenceFlag[];
 }
 
 export interface ManualCostBasisOverrideInput {
@@ -251,6 +272,13 @@ export interface PortfolioSummary {
   reporting_currency: string;
   display_currency: DisplayCurrency;
   tax_jurisdiction?: TaxJurisdiction;
+  /** Blended effective harvest savings rate (savings / loss). */
+  tax_harvest_rate?: number;
+  tax_harvest_basic_rate?: number;
+  tax_harvest_higher_rate?: number;
+  tax_harvest_ordinary_rate?: number;
+  tax_harvest_ltcg_rate?: number;
+  tax_harvest_unused_basic_band?: number;
   perps?: PerpsSummary;
 }
 

@@ -1547,7 +1547,7 @@ def delete_transaction(transaction_id: str) -> Dict[str, bool]:
 
 
 @app.get("/api/settings")
-def get_settings() -> Dict[str, str]:
+def get_settings() -> Dict[str, object]:
     jurisdiction = state.tax_jurisdiction()
     return {
         "tax_jurisdiction": jurisdiction,
@@ -1555,11 +1555,14 @@ def get_settings() -> Dict[str, str]:
         "uk_perp_treatment": state.perp_treatment("UK"),
         "us_perp_treatment": state.perp_treatment("US"),
         "data_mode": state.data_mode(),
+        "uk_unused_basic_band": state.uk_unused_basic_band(),
+        "us_ordinary_income_rate": state.us_ordinary_income_rate(),
+        "us_long_term_cg_rate": state.us_long_term_cg_rate(),
     }
 
 
 @app.patch("/api/settings")
-def update_settings(payload: TaxSettingsUpdate) -> Dict[str, str]:
+def update_settings(payload: TaxSettingsUpdate) -> Dict[str, object]:
     if payload.data_mode is not None:
         try:
             state.set_data_mode(payload.data_mode)
@@ -1583,6 +1586,19 @@ def update_settings(payload: TaxSettingsUpdate) -> Dict[str, str]:
             continue
         try:
             state.set_perp_treatment(code, value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if payload.uk_unused_basic_band is not None:
+        state.set_uk_unused_basic_band(payload.uk_unused_basic_band)
+    if payload.us_ordinary_income_rate is not None:
+        try:
+            state.set_us_ordinary_income_rate(payload.us_ordinary_income_rate)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.us_long_term_cg_rate is not None:
+        try:
+            state.set_us_long_term_cg_rate(payload.us_long_term_cg_rate)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1793,7 +1809,16 @@ def portfolio(
     tradable_for_harvest = [
         p for p in all_holdings if not is_stablecoin(p.asset)
     ]
-    harvest = build_tax_harvest_matrix(tradable_for_harvest)
+    harvest = build_tax_harvest_matrix(
+        tradable_for_harvest,
+        tax_jurisdiction=jurisdiction,
+        transactions=tax_txs,
+        method=accounting,
+        prices_usd=prices,
+        uk_unused_basic_band=state.uk_unused_basic_band(),
+        us_ordinary_rate=state.us_ordinary_income_rate(),
+        us_ltcg_rate=state.us_long_term_cg_rate(),
+    )
     realized_by_asset = calculate_realized_pnl_by_asset(
         tax_txs, accounting, tax_jurisdiction=jurisdiction
     )
@@ -1859,6 +1884,9 @@ def portfolio(
         tax_jurisdiction=jurisdiction,
         reporting_currency=reporting_currency_for(jurisdiction),
         perps_reporting=perps_summary,
+        uk_unused_basic_band=state.uk_unused_basic_band(),
+        us_ordinary_rate=state.us_ordinary_income_rate(),
+        us_ltcg_rate=state.us_long_term_cg_rate(),
     )
 
 

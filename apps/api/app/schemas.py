@@ -138,6 +138,13 @@ class Transaction(BaseModel):
         default=None,
         description="Parent ticker for hard-fork acquisitions (e.g. ETH for ETHW).",
     )
+    normalization_note: Optional[str] = Field(
+        default=None,
+        description=(
+            "Human-readable note when a row was synthesized or inferred during "
+            "normalization (e.g. an LP burn reconstructed from a missing mint leg)."
+        ),
+    )
 
     @field_validator("asset")
     @classmethod
@@ -381,11 +388,24 @@ class ManualCostBasisOverrideCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class LpInferenceFlag(BaseModel):
+    """An LP disposal that was reconstructed because the on-chain burn was missing."""
+
+    transaction_id: str
+    asset: str
+    timestamp: datetime
+    quantity: float
+    proceeds: float
+    ambiguous: bool = False
+    message: str
+
+
 class DataHealthSummary(BaseModel):
     """Data Health Ledger scan results and saved manual overrides."""
 
     orphaned_inflows: List[OrphanedInflowFlag] = Field(default_factory=list)
     cost_basis_overrides: List[ManualCostBasisOverride] = Field(default_factory=list)
+    lp_inference_notes: List[LpInferenceFlag] = Field(default_factory=list)
 
 
 class Position(BaseModel):
@@ -462,6 +482,12 @@ class TaxHarvestRow(BaseModel):
     current_value: float
     unrealized_loss: float
     potential_tax_savings: float
+    # UK: loss sliced across unused basic-rate band then higher rate.
+    basic_rate_loss: float = 0.0
+    higher_rate_loss: float = 0.0
+    # US: unrealised PnL on short- vs long-term lots if sold today (losses ≥ 0).
+    short_term_loss: float = 0.0
+    long_term_loss: float = 0.0
 
 
 class IncomeSummary(BaseModel):
@@ -516,6 +542,14 @@ class PortfolioSummary(BaseModel):
     reporting_currency: str = "GBP"
     display_currency: str = "GBP"
     tax_jurisdiction: str = "UK"
+    # Effective blended savings rate for this harvest set (savings / loss).
+    tax_harvest_rate: float = 0.24
+    # Rate schedule used for the estimate (fractions, e.g. 0.18).
+    tax_harvest_basic_rate: float = 0.18
+    tax_harvest_higher_rate: float = 0.24
+    tax_harvest_ordinary_rate: float = 0.24
+    tax_harvest_ltcg_rate: float = 0.15
+    tax_harvest_unused_basic_band: float = 0.0
     perps: PerpsSummary = Field(default_factory=PerpsSummary)
 
 
@@ -679,6 +713,26 @@ class TaxSettingsUpdate(BaseModel):
     )
     us_perp_treatment: Optional[str] = Field(
         default=None, description="exclude | income | capital_gains"
+    )
+    uk_unused_basic_band: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Unused UK basic-rate Income Tax band (GBP) for CGT rate banding "
+            "on harvest estimates."
+        ),
+    )
+    us_ordinary_income_rate: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Illustrative US ordinary / short-term rate (0–1).",
+    )
+    us_long_term_cg_rate: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Illustrative US long-term capital gains rate (0–1).",
     )
 
 

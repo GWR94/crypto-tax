@@ -8,6 +8,7 @@ LP-share acquisition (add), or LP disposal plus re-acquisition of assets (remove
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import LP_TAX_TREATMENT, is_stablecoin
@@ -21,6 +22,8 @@ from .schemas import Transaction, TransactionType, is_perp_transaction
 from .solana_lending import LENDING_PRINCIPAL_ASSETS
 
 _MIN_FIAT = 0.01
+_MIN_QTY = 1e-9
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _sym(asset: str) -> str:
@@ -37,6 +40,12 @@ def _is_principal(asset: str, token_mint: Optional[str] = None) -> bool:
 def _is_lp_share(tx: Transaction) -> bool:
     if tx.asset.upper().startswith("LP:"):
         return True
+    # Explicit LP receipt/burn from the Solana LP parser.
+    if tx.venue_order_type == "amm_lp":
+        return True
+    # Pool underlyings (including altcoins) tagged by the same parser.
+    if tx.venue_order_type == "amm_lp_pool":
+        return False
     return not _is_principal(tx.asset, tx.token_mint)
 
 
@@ -167,6 +176,34 @@ def _sum_fiat(txs: Iterable[Transaction]) -> float:
     return round(total, 2)
 
 
+def _is_lp_acquisition_row(tx: Transaction) -> bool:
+    """True for a row that adds an LP share to holdings."""
+    if not _is_lp_share(tx):
+        return False
+    if tx.transaction_type in {
+        TransactionType.BUY,
+        TransactionType.AIRDROP,
+        TransactionType.STAKING,
+    }:
+        return True
+    return (
+        tx.transaction_type == TransactionType.TRANSFER
+        and tx.transfer_direction == "IN"
+    )
+
+
+def _is_lp_disposal_row(tx: Transaction) -> bool:
+    """True for a row that removes an LP share from holdings."""
+    if not _is_lp_share(tx):
+        return False
+    if tx.transaction_type == TransactionType.SELL:
+        return True
+    return (
+        tx.transaction_type == TransactionType.TRANSFER
+        and tx.transfer_direction == "OUT"
+    )
+
+
 def _currency_of(txs: Sequence[Transaction], fallback: str = "GBP") -> str:
     for tx in txs:
         if tx.fiat_currency:
@@ -194,6 +231,10 @@ def normalize_lp_for_tax(
     extras: List[Transaction] = []
     existing_ids = {t.id for t in transactions}
     changed = 0
+
+    # Removes whose on-chain LP burn leg is missing; resolved after adds so the
+    # open LP lots (real mints + synthetic shares) all exist first.
+    pending_infer: List[Dict[str, object]] = []
 
     for gid, group in by_gid.items():
         classified = _classify_group(group)
@@ -255,24 +296,41 @@ def normalize_lp_for_tax(
             proceeds = _sum_fiat(acquisitions)
             currency = _currency_of(acquisitions)
 
-            # Close the LP lot only when a share burn/out leg is present (real mint
-            # or synthetic ``LP:{add_gid}``). Do not invent a new LP:{remove_gid}
-            # asset — that would never match the add acquisition.
-            for leg in lp_out:
-                updated = _as_lp_disposal(leg, EVENT_LP_REMOVE)
-                if (
-                    proceeds >= _MIN_FIAT
-                    and updated.fiat_value_at_trigger < _MIN_FIAT
-                ):
-                    updated = updated.model_copy(
-                        update={
-                            "fiat_value_at_trigger": proceeds,
-                            "fiat_currency": currency,
-                        }
-                    )
-                if updated != leg:
-                    patches[leg.id] = updated
-                    changed += 1
+            if lp_out:
+                # Real burn present: close the disposed LP share directly.
+                for leg in lp_out:
+                    updated = _as_lp_disposal(leg, EVENT_LP_REMOVE)
+                    if (
+                        proceeds >= _MIN_FIAT
+                        and updated.fiat_value_at_trigger < _MIN_FIAT
+                    ):
+                        updated = updated.model_copy(
+                            update={
+                                "fiat_value_at_trigger": proceeds,
+                                "fiat_currency": currency,
+                            }
+                        )
+                    if updated != leg:
+                        patches[leg.id] = updated
+                        changed += 1
+            else:
+                # Indexer omitted the LP burn. Defer: infer a disposal of the
+                # matching open LP lot once all adds are booked.
+                anchor = acquisitions[0] if acquisitions else None
+                pending_infer.append(
+                    {
+                        "gid": gid,
+                        "timestamp": anchor.timestamp if anchor else None,
+                        "proceeds": proceeds,
+                        "currency": currency,
+                        "source": (anchor.source if anchor else None) or "amm_lp",
+                    }
+                )
+
+    if pending_infer:
+        changed += _infer_missing_burns(
+            transactions, patches, extras, existing_ids, pending_infer
+        )
 
     if not patches and not extras:
         return transactions, 0
@@ -280,3 +338,115 @@ def normalize_lp_for_tax(
     merged = [patches.get(tx.id, tx) for tx in transactions] + extras
     merged.sort(key=lambda t: (t.timestamp, t.id))
     return merged, changed
+
+
+def _open_lp_lots(
+    transactions: List[Transaction],
+    patches: Dict[str, Transaction],
+    extras: List[Transaction],
+) -> List[Dict[str, object]]:
+    """Open LP acquisition lots (qty remaining after any LP disposals), FIFO order."""
+    effective = [patches.get(t.id, t) for t in transactions] + list(extras)
+
+    lots: List[Dict[str, object]] = []
+    for tx in effective:
+        if _is_lp_acquisition_row(tx) and tx.amount > 0:
+            lots.append(
+                {
+                    "id": tx.id,
+                    "asset": tx.asset,
+                    "timestamp": tx.timestamp,
+                    "remaining": float(tx.amount),
+                }
+            )
+    lots.sort(key=lambda lot: (lot["timestamp"], lot["id"]))
+
+    # Consume already-disposed LP quantity (explicit burns / prior removes) FIFO.
+    for tx in sorted(effective, key=lambda t: (t.timestamp, t.id)):
+        if not _is_lp_disposal_row(tx):
+            continue
+        qty = float(tx.amount)
+        for lot in lots:
+            if qty <= _MIN_QTY:
+                break
+            if lot["asset"] != tx.asset:
+                continue
+            take = min(qty, float(lot["remaining"]))
+            lot["remaining"] = float(lot["remaining"]) - take
+            qty -= take
+
+    return [lot for lot in lots if float(lot["remaining"]) > _MIN_QTY]
+
+
+def _infer_missing_burns(
+    transactions: List[Transaction],
+    patches: Dict[str, Transaction],
+    extras: List[Transaction],
+    existing_ids: set,
+    pending: List[Dict[str, object]],
+) -> int:
+    """Synthesize an LP-share disposal for each remove whose burn leg is missing."""
+    lots = _open_lp_lots(transactions, patches, extras)
+    changed = 0
+
+    def _remove_ts(item: Dict[str, object]):
+        return item["timestamp"] or _EPOCH
+
+    for item in sorted(pending, key=_remove_ts):
+        proceeds = float(item["proceeds"])
+        gid = str(item["gid"])
+        ts = item["timestamp"]
+
+        open_lots = [lot for lot in lots if float(lot["remaining"]) > _MIN_QTY]
+        if not open_lots:
+            continue
+
+        # Prefer lots acquired at/before the remove; else fall back to oldest.
+        if ts is not None:
+            eligible = [lot for lot in open_lots if lot["timestamp"] <= ts]
+        else:
+            eligible = []
+        candidates = eligible or open_lots
+        chosen = candidates[0]
+
+        distinct_assets = {lot["asset"] for lot in open_lots}
+        ambiguous = len(open_lots) > 1
+        currency = str(item["currency"]) if proceeds > 0 else None
+
+        synth_id = f"lp-dispose-{gid}"
+        if synth_id in existing_ids or any(t.id == synth_id for t in extras):
+            continue
+
+        note = (
+            "LP burn leg missing from import; disposal inferred against open "
+            f"position {chosen['asset']}."
+        )
+        if ambiguous:
+            note += (
+                f" {len(open_lots)} open LP positions"
+                f"{' across ' + str(len(distinct_assets)) + ' assets' if len(distinct_assets) > 1 else ''}"
+                " — matched oldest; verify."
+            )
+
+        anchor_ts = ts or chosen["timestamp"]
+        extras.append(
+            Transaction(
+                id=synth_id,
+                timestamp=anchor_ts,
+                asset=str(chosen["asset"]),
+                transaction_type=TransactionType.SELL,
+                amount=float(chosen["remaining"]),
+                fiat_value_at_trigger=round(max(0.0, proceeds), 2),
+                fee_fiat=0.0,
+                fiat_currency=currency,
+                source=str(item["source"]),
+                trade_group_id=gid,
+                on_chain_tx_id=gid,
+                event_subtype=EVENT_LP_REMOVE,
+                normalization_note=note,
+            )
+        )
+        chosen["remaining"] = 0.0
+        changed += 1
+
+    return changed

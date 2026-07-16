@@ -774,6 +774,28 @@ export function Dashboard() {
               currency={summary.display_currency}
               assetLabels={assetLabels}
               jurisdiction={taxJurisdiction}
+              estimateRate={summary.tax_harvest_rate}
+              basicRate={summary.tax_harvest_basic_rate}
+              higherRate={summary.tax_harvest_higher_rate}
+              ordinaryRate={summary.tax_harvest_ordinary_rate}
+              ltcgRate={summary.tax_harvest_ltcg_rate}
+              unusedBasicBand={summary.tax_harvest_unused_basic_band}
+              bandCurrency={
+                (summary.reporting_currency as DisplayCurrency) ?? "GBP"
+              }
+              ratesBusy={busy === "harvest-rates"}
+              onRatesChange={async (update) => {
+                setBusy("harvest-rates");
+                setError(null);
+                try {
+                  await api.updateSettings(update);
+                  await fetchDashboard();
+                } catch (e) {
+                  setError(String(e));
+                } finally {
+                  setBusy(null);
+                }
+              }}
             />
 
             <TaxReporter

@@ -16,6 +16,11 @@ from typing import Dict, List, Tuple
 from .config import (
     REPORTING_CURRENCY,
     TAX_JURISDICTION,
+    UK_CGT_BASIC_RATE,
+    UK_CGT_HIGHER_RATE,
+    UK_UNUSED_BASIC_BAND_DEFAULT,
+    US_LONG_TERM_CG_RATE,
+    US_ORDINARY_INCOME_RATE,
     is_stablecoin,
     reporting_currency_for,
 )
@@ -55,9 +60,6 @@ AMOUNT_MATCH_REL_TOL = float(LOT_EPS)
 
 # Positions valued below this threshold (in reporting currency) are ignored.
 DUST_THRESHOLD_REPORTING = 0.50
-
-# Flat estimated capital-gains tax rate used for tax-loss-harvesting savings.
-TAX_LOSS_HARVEST_RATE = 0.20
 
 
 # --- Internal lot bookkeeping ----------------------------------------------
@@ -839,20 +841,161 @@ def _income_summary(result: EngineResult) -> IncomeSummary:
     )
 
 
-def build_tax_harvest_matrix(positions: List[Position]) -> List[TaxHarvestRow]:
-    """Filter positions to losers and compute potential tax savings."""
+def build_tax_harvest_matrix(
+    positions: List[Position],
+    *,
+    tax_jurisdiction: str | None = None,
+    transactions: List[Transaction] | None = None,
+    method: AccountingMethod = AccountingMethod.FIFO,
+    prices_usd: Dict[str, float] | None = None,
+    as_of: datetime | None = None,
+    uk_unused_basic_band: float | None = None,
+    us_ordinary_rate: float | None = None,
+    us_ltcg_rate: float | None = None,
+) -> List[TaxHarvestRow]:
+    """Filter positions to losers and estimate potential tax savings.
+
+    UK: apply basic-rate CGT to losses until ``uk_unused_basic_band`` is
+    exhausted, then higher-rate CGT on the remainder (largest losses first).
+
+    US: when open lots are available, split each asset's unrealised PnL into
+    short-term (ordinary) and long-term (LTCG) as if sold ``as_of`` today;
+    savings = max(0, -(st_pnl × ordinary + lt_pnl × ltcg)).
+    Without lots, fall back to flat LTCG on the net unrealised loss.
+    """
+    jurisdiction = (tax_jurisdiction or TAX_JURISDICTION).upper()
+    losers = [p for p in positions if p.unrealized_pnl < 0]
+    if not losers:
+        return []
+
+    if jurisdiction == "UK":
+        return _uk_harvest_rows(
+            losers,
+            unused_basic_band=(
+                UK_UNUSED_BASIC_BAND_DEFAULT
+                if uk_unused_basic_band is None
+                else max(0.0, float(uk_unused_basic_band))
+            ),
+        )
+
+    return _us_harvest_rows(
+        losers,
+        transactions=transactions,
+        method=method,
+        prices_usd=prices_usd or {},
+        as_of=as_of or datetime.now(timezone.utc),
+        ordinary_rate=(
+            US_ORDINARY_INCOME_RATE
+            if us_ordinary_rate is None
+            else float(us_ordinary_rate)
+        ),
+        ltcg_rate=(
+            US_LONG_TERM_CG_RATE if us_ltcg_rate is None else float(us_ltcg_rate)
+        ),
+    )
+
+
+def _uk_harvest_rows(
+    losers: List[Position],
+    *,
+    unused_basic_band: float,
+) -> List[TaxHarvestRow]:
+    """Slice losses across unused basic-rate band, then higher rate."""
+    ordered = sorted(losers, key=lambda p: abs(p.unrealized_pnl), reverse=True)
+    remaining_band = max(0.0, unused_basic_band)
     rows: List[TaxHarvestRow] = []
-    for pos in positions:
-        if pos.unrealized_pnl < 0:
-            loss = abs(pos.unrealized_pnl)
-            rows.append(
-                TaxHarvestRow(
-                    asset=pos.asset,
-                    current_bags=pos.quantity,
-                    current_value=pos.current_value,
-                    unrealized_loss=round(loss, 2),
-                    potential_tax_savings=round(loss * TAX_LOSS_HARVEST_RATE, 2),
-                )
+    for pos in ordered:
+        loss = abs(pos.unrealized_pnl)
+        basic = min(loss, remaining_band)
+        higher = loss - basic
+        remaining_band -= basic
+        savings = basic * UK_CGT_BASIC_RATE + higher * UK_CGT_HIGHER_RATE
+        rows.append(
+            TaxHarvestRow(
+                asset=pos.asset,
+                current_bags=pos.quantity,
+                current_value=pos.current_value,
+                unrealized_loss=round(loss, 2),
+                potential_tax_savings=round(savings, 2),
+                basic_rate_loss=round(basic, 2),
+                higher_rate_loss=round(higher, 2),
             )
-    rows.sort(key=lambda r: r.unrealized_loss, reverse=True)
+        )
+    return rows
+
+
+def _us_lot_term_pnl(
+    transactions: List[Transaction],
+    method: AccountingMethod,
+    prices_usd: Dict[str, float],
+    as_of: datetime,
+) -> Dict[str, Tuple[float, float]]:
+    """Per asset ``(short_term_pnl, long_term_pnl)`` if sold at ``as_of``."""
+    reporting_currency = reporting_currency_for("US")
+    result = _run_engine(
+        transactions, method, reporting_currency=reporting_currency
+    )
+    out: Dict[str, Tuple[float, float]] = {}
+    for asset, lots in result.open_lots.items():
+        st = 0.0
+        lt = 0.0
+        price = _price_reporting(
+            float(prices_usd.get(asset, 0.0)),
+            reporting_currency=reporting_currency,
+        )
+        for lot in lots:
+            if lot.quantity <= LOT_EPS:
+                continue
+            qty = as_float_qty(lot.quantity)
+            cost = lot.remaining_cost_basis
+            pnl = qty * price - cost
+            term, _days = _holding_term(lot.acquired_at, as_of)
+            if term == "LONG":
+                lt += pnl
+            else:
+                st += pnl
+        out[asset] = (st, lt)
+    return out
+
+
+def _us_harvest_rows(
+    losers: List[Position],
+    *,
+    transactions: List[Transaction] | None,
+    method: AccountingMethod,
+    prices_usd: Dict[str, float],
+    as_of: datetime,
+    ordinary_rate: float,
+    ltcg_rate: float,
+) -> List[TaxHarvestRow]:
+    term_pnl: Dict[str, Tuple[float, float]] = {}
+    if transactions:
+        term_pnl = _us_lot_term_pnl(transactions, method, prices_usd, as_of)
+
+    rows: List[TaxHarvestRow] = []
+    for pos in sorted(losers, key=lambda p: abs(p.unrealized_pnl), reverse=True):
+        loss = abs(pos.unrealized_pnl)
+        st_pnl, lt_pnl = term_pnl.get(pos.asset, (0.0, 0.0))
+        if pos.asset in term_pnl:
+            # Tax if the whole position were sold today (gains positive).
+            tax_if_sold = st_pnl * ordinary_rate + lt_pnl * ltcg_rate
+            savings = max(0.0, -tax_if_sold)
+            st_loss = abs(min(0.0, st_pnl))
+            lt_loss = abs(min(0.0, lt_pnl))
+        else:
+            # No lot detail — assume long-term.
+            savings = loss * ltcg_rate
+            st_loss = 0.0
+            lt_loss = loss
+        rows.append(
+            TaxHarvestRow(
+                asset=pos.asset,
+                current_bags=pos.quantity,
+                current_value=pos.current_value,
+                unrealized_loss=round(loss, 2),
+                potential_tax_savings=round(savings, 2),
+                short_term_loss=round(st_loss, 2),
+                long_term_loss=round(lt_loss, 2),
+            )
+        )
     return rows

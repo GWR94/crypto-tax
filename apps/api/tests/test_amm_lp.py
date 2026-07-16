@@ -145,6 +145,78 @@ def test_lp_remove_with_share_burn_closes_basis():
     assert lp_disp.gain == 15.0
 
 
+def test_lp_remove_without_burn_infers_disposal():
+    """Indexer omitted the LP burn leg — dispose the open LP share anyway."""
+    add, _ = normalize_lp_for_tax(
+        [
+            _tx("sol-a", "2024-06-01T12:00:00", "SOL", TransactionType.TRANSFER, 1, 145, direction="OUT", gid="add1"),
+            _tx("usdc-a", "2024-06-01T12:00:00", "USDC", TransactionType.TRANSFER, 150, 150, direction="OUT", gid="add1"),
+        ]
+    )
+    remove_legs = [
+        _tx("sol-b", "2024-09-01T12:00:00", "SOL", TransactionType.TRANSFER, 1, 160, direction="IN", gid="rm1"),
+        _tx("usdc-b", "2024-09-01T12:00:00", "USDC", TransactionType.TRANSFER, 150, 150, direction="IN", gid="rm1"),
+    ]
+    out, n = normalize_lp_for_tax(add + remove_legs)
+    assert n >= 1
+
+    burn = next(t for t in out if t.id == "lp-dispose-rm1")
+    assert burn.transaction_type == TransactionType.SELL
+    assert burn.event_subtype == EVENT_LP_REMOVE
+    assert burn.asset == "LP:ADD1"
+    assert burn.fiat_value_at_trigger == 310.0
+    assert burn.normalization_note
+
+    # Pool fully closed; principals re-acquired.
+    pools = compute_uk_open_pools(out)
+    assert "LP:ADD1" not in pools
+
+    report = calculate_uk_cgt(out, tax_year_label="2024/25")
+    lp_disp = next(r for r in report.rows if r.disposal_id == "lp-dispose-rm1")
+    assert lp_disp.allowable_cost == 295.0
+    assert lp_disp.gain == 15.0
+
+
+def test_lp_remove_without_burn_multiple_open_lots_picks_oldest():
+    add, _ = normalize_lp_for_tax(
+        [
+            _tx("sol-1", "2024-06-01T12:00:00", "SOL", TransactionType.TRANSFER, 1, 145, direction="OUT", gid="add1"),
+            _tx("usdc-1", "2024-06-01T12:00:00", "USDC", TransactionType.TRANSFER, 150, 150, direction="OUT", gid="add1"),
+            _tx("sol-2", "2024-07-01T12:00:00", "SOL", TransactionType.TRANSFER, 1, 200, direction="OUT", gid="add2"),
+            _tx("usdc-2", "2024-07-01T12:00:00", "USDC", TransactionType.TRANSFER, 200, 200, direction="OUT", gid="add2"),
+        ]
+    )
+    remove_legs = [
+        _tx("sol-b", "2024-09-01T12:00:00", "SOL", TransactionType.TRANSFER, 1, 160, direction="IN", gid="rm1"),
+        _tx("usdc-b", "2024-09-01T12:00:00", "USDC", TransactionType.TRANSFER, 150, 150, direction="IN", gid="rm1"),
+    ]
+    out, _ = normalize_lp_for_tax(add + remove_legs)
+
+    burn = next(t for t in out if t.id == "lp-dispose-rm1")
+    assert burn.asset == "LP:ADD1"  # oldest lot
+    assert "verify" in burn.normalization_note.lower()
+
+    pools = compute_uk_open_pools(out)
+    assert "LP:ADD1" not in pools
+    assert "LP:ADD2" in pools  # newer lot untouched
+
+
+def test_lp_remove_with_burn_is_not_double_inferred():
+    add, _ = normalize_lp_for_tax(
+        [
+            _tx("sol-a", "2024-06-01T12:00:00", "SOL", TransactionType.TRANSFER, 1, 145, direction="OUT", gid="add1"),
+            _tx("usdc-a", "2024-06-01T12:00:00", "USDC", TransactionType.TRANSFER, 150, 150, direction="OUT", gid="add1"),
+        ]
+    )
+    remove_legs = [
+        _tx("lp-burn", "2024-09-01T12:00:00", "LP:ADD1", TransactionType.TRANSFER, 1, 0, direction="OUT", gid="rm1"),
+        _tx("sol-b", "2024-09-01T12:00:00", "SOL", TransactionType.TRANSFER, 1, 160, direction="IN", gid="rm1"),
+        _tx("usdc-b", "2024-09-01T12:00:00", "USDC", TransactionType.TRANSFER, 150, 150, direction="IN", gid="rm1"),
+    ]
+    out, _ = normalize_lp_for_tax(add + remove_legs)
+    assert not any(t.id.startswith("lp-dispose-") for t in out)
+
+
 def test_lp_add_with_explicit_mint_reuses_receipt_leg():
     mint = "So11111111111111111111111111111111111111112LP"
     txs, _ = normalize_lp_for_tax(

@@ -466,6 +466,11 @@ def is_solana_spam(tx: Transaction) -> bool:
     if tx.source != "solana":
         return False
 
+    # Real LP receipt/burn + pool-underlying legs look like unlisted tokens;
+    # keep them so the LP normalizer can price and close the position.
+    if tx.venue_order_type in {"amm_lp", "amm_lp_pool"}:
+        return False
+
     if is_scam_token_label(tx.asset):
         return True
 
@@ -1247,6 +1252,232 @@ def _aggregate_swap_legs(
     return nets, value_in, value_out, mints
 
 
+def _token_change(row: dict) -> str:
+    """SPL supply-change marker from the fetch layer: ``burn`` / ``mint``."""
+    return _str_field(row.get("token_change") or row.get("token change")).lower()
+
+
+_AMM_LP_LIQUIDITY_TYPES = frozenset(
+    {
+        "ADD_LIQUIDITY",
+        "WITHDRAW_LIQUIDITY",
+        "REMOVE_LIQUIDITY",
+        "REMOVE_LIQUIDITY_BY_RANGE",
+        "REMOVE_LIQUIDITY_SINGLE_SIDE",
+        "INCREASE_LIQUIDITY",
+        "DECREASE_LIQUIDITY",
+        # PumpSwap / some constant-product AMMs use deposit/withdraw naming.
+        "DEPOSIT",
+        "WITHDRAW",
+    }
+)
+
+# Sources that use DEPOSIT/WITHDRAW for LP (not lending). Without this gate,
+# generic DEPOSIT would also match Kamino/Marginfi.
+_AMM_LP_LIQUIDITY_SOURCES = frozenset(
+    {
+        "RAYDIUM",
+        "ORCA",
+        "METEORA",
+        "PUMP_AMM",
+        "PUMP_FUN",
+        "LIFINITY",
+        "ALDRIN",
+        "SAROS",
+        "CREMA",
+        "CROPPER",
+        "STEP_FINANCE",
+        "MERCURIAL",
+    }
+)
+
+
+def _is_liquidity_helius_group(rows: List[dict]) -> bool:
+    for row in rows:
+        htype = _helius_type(row)
+        if htype in {
+            "ADD_LIQUIDITY",
+            "WITHDRAW_LIQUIDITY",
+            "REMOVE_LIQUIDITY",
+            "REMOVE_LIQUIDITY_BY_RANGE",
+            "REMOVE_LIQUIDITY_SINGLE_SIDE",
+            "INCREASE_LIQUIDITY",
+            "DECREASE_LIQUIDITY",
+        }:
+            return True
+        if htype in {"DEPOSIT", "WITHDRAW"}:
+            if _helius_source(row) in _AMM_LP_LIQUIDITY_SOURCES:
+                return True
+    return False
+
+
+def _is_lp_principal_asset(asset: str) -> bool:
+    return _is_core_solana_asset(asset) or is_stablecoin(_sym(asset))
+
+
+def _pool_asset_net_flows(
+    rows: List[dict],
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Optional[str]]]:
+    """Net non-supply-change flows per asset (pool underlyings after hop netting).
+
+    Positive = in, negative = out. Excludes burn/mint receipt legs and rent.
+    """
+    nets: Dict[str, float] = defaultdict(float)
+    values: Dict[str, float] = defaultdict(float)
+    mints: Dict[str, Optional[str]] = {}
+    for row in rows:
+        if _token_change(row) in ("burn", "mint"):
+            continue
+        if _is_solana_rent_row(row):
+            continue
+        asset, token_mint = _resolve_asset(row)
+        amount = _human_amount(row)
+        if amount <= 0:
+            continue
+        mints[asset] = token_mint
+        value = _usd_value(row.get("value"))
+        if _flow(row.get("flow")) == "in":
+            nets[asset] += amount
+        else:
+            nets[asset] -= amount
+        values[asset] += value
+    return nets, values, mints
+
+
+def _principal_net_flows(
+    rows: List[dict],
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Optional[str]]]:
+    """Net core/stable principal flows only (used as a spam-burn safety gate)."""
+    nets, values, mints = _pool_asset_net_flows(rows)
+    filtered_nets = {
+        asset: qty for asset, qty in nets.items() if _is_lp_principal_asset(asset)
+    }
+    filtered_values = {asset: values[asset] for asset in filtered_nets}
+    filtered_mints = {asset: mints[asset] for asset in filtered_nets}
+    return filtered_nets, filtered_values, filtered_mints
+
+
+def _amm_lp_supply_legs(rows: List[dict]) -> Dict[str, dict]:
+    """Net LP-share supply change per mint (mint credits +, burn debits -)."""
+    agg: Dict[str, dict] = {}
+    for row in rows:
+        change = _token_change(row)
+        if change not in ("burn", "mint"):
+            continue
+        asset, token_mint = _resolve_asset(row)
+        amount = _human_amount(row)
+        if amount <= 0:
+            continue
+        key = token_mint or asset
+        entry = agg.setdefault(
+            key, {"asset": asset, "mint": token_mint, "net": 0.0, "value": 0.0}
+        )
+        entry["net"] += amount if change == "mint" else -amount
+        entry["value"] += _usd_value(row.get("value"))
+    return agg
+
+
+def _is_amm_lp_group(rows: List[dict]) -> bool:
+    """True for a signature that captured a real LP receipt (mint) or burn leg.
+
+    Requires the supply-change leg to be accompanied by pool assets moving the
+    expected direction. Core/stable principals always qualify; Helius-tagged
+    liquidity events may also use altcoin underlyings (e.g. LIKE-WSOL).
+    """
+    legs = _amm_lp_supply_legs(rows)
+    if not any(abs(v["net"]) > SWAP_NET_EPS for v in legs.values()):
+        return False
+    pool_nets, _, _ = _pool_asset_net_flows(rows)
+    core_nets, _, _ = _principal_net_flows(rows)
+    has_mint = any(v["net"] > SWAP_NET_EPS for v in legs.values())
+    has_burn = any(v["net"] < -SWAP_NET_EPS for v in legs.values())
+    liquidity = _is_liquidity_helius_group(rows)
+    nets = pool_nets if liquidity else core_nets
+    asset_out = any(q < -SWAP_NET_EPS for q in nets.values())
+    asset_in = any(q > SWAP_NET_EPS for q in nets.values())
+    if has_mint and asset_out:
+        return True
+    if has_burn and asset_in:
+        return True
+    return False
+
+
+def _parse_amm_lp_group(
+    rows: List[dict], wallet: Optional[str]
+) -> List[Transaction]:
+    """Preserve real LP add/remove legs (pool assets + LP receipt/burn) as transfers.
+
+    Emitted transfers are re-booked as CGT events by ``normalize_lp_for_tax``.
+    The LP-share leg is tagged ``venue_order_type='amm_lp'``; pool underlyings
+    use ``amm_lp_pool`` so spam/dust filters keep altcoin legs (e.g. LIKE).
+    """
+    del wallet  # wallet already applied when rows were built
+    timestamp = _parse_time(rows[0].get("human_time"))
+    sig = _str_field(rows[0].get("signature")) or None
+    trade_group_id = sig
+    # Prefer full pool-asset nets once we're sure this is an LP group so
+    # altcoin underlyings survive hop netting.
+    nets, values, mints = _pool_asset_net_flows(rows)
+    legs = _amm_lp_supply_legs(rows)
+
+    transactions: List[Transaction] = []
+    for asset in sorted(nets):
+        net = nets[asset]
+        if abs(net) <= SWAP_NET_EPS:
+            continue
+        direction = "IN" if net > 0 else "OUT"
+        fiat = values.get(asset, 0.0)
+        suffix = "in" if net > 0 else "out"
+        transactions.append(
+            Transaction(
+                id=f"sol-{trade_group_id or timestamp.isoformat()}-lp-{suffix}-{asset}",
+                timestamp=timestamp,
+                asset=asset,
+                transaction_type=TransactionType.TRANSFER,
+                amount=abs(net),
+                fiat_value_at_trigger=round(max(0.0, fiat), 2),
+                fee_fiat=0.0,
+                fiat_currency="USD" if fiat > 0 else None,
+                source="solana",
+                transfer_direction=direction,
+                trade_group_id=trade_group_id,
+                token_mint=mints.get(asset),
+                on_chain_tx_id=sig,
+                venue_order_type="amm_lp_pool",
+            )
+        )
+
+    for entry in legs.values():
+        net = float(entry["net"])
+        if abs(net) <= SWAP_NET_EPS:
+            continue
+        direction = "IN" if net > 0 else "OUT"
+        kind = "mint" if net > 0 else "burn"
+        asset = str(entry["asset"])
+        token_mint = entry["mint"]
+        fiat = float(entry["value"])
+        transactions.append(
+            Transaction(
+                id=f"sol-{trade_group_id or timestamp.isoformat()}-lp-{kind}-{token_mint or asset}",
+                timestamp=timestamp,
+                asset=asset,
+                transaction_type=TransactionType.TRANSFER,
+                amount=abs(net),
+                fiat_value_at_trigger=round(max(0.0, fiat), 2),
+                fee_fiat=0.0,
+                fiat_currency="USD" if fiat > 0 else None,
+                source="solana",
+                transfer_direction=direction,
+                trade_group_id=trade_group_id,
+                token_mint=token_mint,
+                on_chain_tx_id=sig,
+                venue_order_type="amm_lp",
+            )
+        )
+
+    return transactions
+
+
 def _parse_swap_group(
     rows: List[dict], wallet: Optional[str]
 ) -> List[Transaction]:
@@ -1397,6 +1628,12 @@ def parse_solana_wallet(df: pd.DataFrame, wallet: Optional[str] = None) -> List[
                 farms_txs = _parse_kamino_farms_group(group, resolved_wallet)
                 if farms_txs:
                     transactions.extend(farms_txs)
+                    processed_sigs.add(sig)
+                    continue
+            if _is_amm_lp_group(group):
+                lp_txs = _parse_amm_lp_group(group, resolved_wallet)
+                if lp_txs:
+                    transactions.extend(lp_txs)
                     processed_sigs.add(sig)
                     continue
             swap_txs = _parse_swap_group(group, resolved_wallet)

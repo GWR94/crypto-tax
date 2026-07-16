@@ -14,6 +14,7 @@ import { api } from "@/lib/api";
 import type {
   AssetLabel,
   DataHealthSummary,
+  LpInferenceFlag,
   ManualCostBasisOverride,
   OrphanedInflowFlag,
 } from "@/lib/types";
@@ -214,7 +215,8 @@ export function DataHealthPanel({
 
   const orphans = dataHealth?.orphaned_inflows ?? [];
   const savedOverrides = dataHealth?.cost_basis_overrides ?? [];
-  const issueCount = orphans.length;
+  const lpNotes = dataHealth?.lp_inference_notes ?? [];
+  const issueCount = orphans.length + lpNotes.length;
 
   if (!issueCount && !savedOverrides.length) return null;
 
@@ -315,6 +317,42 @@ export function DataHealthPanel({
               No orphaned inflows detected. Saved manual overrides remain below.
             </p>
           )}
+
+          {lpNotes.length > 0 ? (
+            <div>
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Inferred LP disposals
+              </p>
+              <ul className="space-y-2">
+                {lpNotes.map((note: LpInferenceFlag) => (
+                  <li
+                    key={note.transaction_id}
+                    className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <AlertTriangle className="h-4 w-4 text-amber-500" />
+                      <Badge
+                        variant={note.ambiguous ? "destructive" : "muted"}
+                        className="text-[10px] uppercase"
+                      >
+                        {note.ambiguous ? "Verify LP match" : "Inferred LP burn"}
+                      </Badge>
+                      <AssetBadge asset={note.asset} labels={assetLabels} />
+                      <span className="text-sm font-medium">
+                        {formatMoney(note.proceeds, currency)} proceeds
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {formatDateTime(note.timestamp)}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {note.message}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
 
           {savedOverrides.length > 0 ? (
             <div>

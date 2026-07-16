@@ -21,6 +21,9 @@ from .config import (
     SUPPORTED_PERP_TREATMENTS,
     SUPPORTED_TAX_JURISDICTIONS,
     TAX_JURISDICTION,
+    UK_UNUSED_BASIC_BAND_DEFAULT,
+    US_LONG_TERM_CG_RATE,
+    US_ORDINARY_INCOME_RATE,
 )
 from .pricing import PriceStore
 from .sample_data import default_transactions, without_sample
@@ -53,6 +56,9 @@ class AppState:
             "UK": DEFAULT_UK_PERP_TREATMENT,
             "US": DEFAULT_US_PERP_TREATMENT,
         }
+        self._uk_unused_basic_band = float(UK_UNUSED_BASIC_BAND_DEFAULT)
+        self._us_ordinary_income_rate = float(US_ORDINARY_INCOME_RATE)
+        self._us_long_term_cg_rate = float(US_LONG_TERM_CG_RATE)
         self.prices = PriceStore()
         self._load_settings()
         self._load_overrides()
@@ -74,6 +80,18 @@ class AppState:
                 mode = str(raw.get("data_mode", "")).lower()
                 if mode in ("live", "demo"):
                     self._data_mode = mode
+                if "uk_unused_basic_band" in raw:
+                    self._uk_unused_basic_band = max(
+                        0.0, float(raw["uk_unused_basic_band"])
+                    )
+                if "us_ordinary_income_rate" in raw:
+                    rate = float(raw["us_ordinary_income_rate"])
+                    if 0.0 <= rate <= 1.0:
+                        self._us_ordinary_income_rate = rate
+                if "us_long_term_cg_rate" in raw:
+                    rate = float(raw["us_long_term_cg_rate"])
+                    if 0.0 <= rate <= 1.0:
+                        self._us_long_term_cg_rate = rate
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
 
@@ -87,6 +105,9 @@ class AppState:
                     "uk_perp_treatment": self._perp_treatment["UK"],
                     "us_perp_treatment": self._perp_treatment["US"],
                     "data_mode": mode,
+                    "uk_unused_basic_band": self._uk_unused_basic_band,
+                    "us_ordinary_income_rate": self._us_ordinary_income_rate,
+                    "us_long_term_cg_rate": self._us_long_term_cg_rate,
                 },
                 indent=2,
             ),
@@ -141,6 +162,43 @@ class AppState:
             self._perp_treatment[code] = value
             self._persist_settings()
             return value
+
+    def uk_unused_basic_band(self) -> float:
+        with self._lock:
+            return self._uk_unused_basic_band
+
+    def set_uk_unused_basic_band(self, amount: float) -> float:
+        value = max(0.0, float(amount))
+        with self._lock:
+            self._uk_unused_basic_band = value
+            self._persist_settings()
+            return self._uk_unused_basic_band
+
+    def us_ordinary_income_rate(self) -> float:
+        with self._lock:
+            return self._us_ordinary_income_rate
+
+    def set_us_ordinary_income_rate(self, rate: float) -> float:
+        value = float(rate)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("us_ordinary_income_rate must be between 0 and 1")
+        with self._lock:
+            self._us_ordinary_income_rate = value
+            self._persist_settings()
+            return self._us_ordinary_income_rate
+
+    def us_long_term_cg_rate(self) -> float:
+        with self._lock:
+            return self._us_long_term_cg_rate
+
+    def set_us_long_term_cg_rate(self, rate: float) -> float:
+        value = float(rate)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("us_long_term_cg_rate must be between 0 and 1")
+        with self._lock:
+            self._us_long_term_cg_rate = value
+            self._persist_settings()
+            return self._us_long_term_cg_rate
 
     def _load_overrides(self) -> None:
         if not OVERRIDES_FILE.exists():
